@@ -19,7 +19,7 @@ source("TransformationAndCompensation.R")
 source("FCSGframework.R")
 
 Sys.setlocale('LC_ALL','C')
-
+options(shiny.maxRequestSize = 100000 * 1024 ^ 2)
 server <- function(input, output, session)
 {
   fixUploadedFilesNames <- function(x) {
