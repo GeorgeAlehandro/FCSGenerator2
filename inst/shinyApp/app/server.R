@@ -1,3715 +1,3291 @@
+library(shiny)
+library(shinydashboard)
+library(shinyjs)
+library(flowCore)
+library(ggplot2)
+library(d3r)
+library(reshape2)
+library(ggridges)
+library(msm)
+library(tcltk)
+library(rlist)
+library(stringr)
+
+source("GenerateFCS.R")
+source("SaveAndLoadFCS.R")
+source("ModifyFCS.R")
+source("MergeFiles.R")
+source("TransformationAndCompensation.R")
+source("FCSGframework.R")
+
+Sys.setlocale('LC_ALL','C')
+
 server <- function(input, output, session)
 {
-    useShinyjs()
-    #======================================================================================================================
-    #======================REACTIVE VALUES=================================================================================
-    #======================================================================================================================
-
-    app.variables <- reactiveValues(
-        fcs.files = NULL,
-        fcs.file.info.table = NULL,
-        sets.list = NULL,
-        populations.list = NULL,
-        output.matrices = NULL,
-        reduction.percentages = NULL,
-        loaded.mutant = NULL,
-        used.events = NULL,
-        log.text = NULL
-    )
-
-    env.var <- reactiveValues(
-        tool.wd = system.file("shinyApp", "app", package = "FCSGenerator2")
-    )
-
-
-    #======================================================================================================================
-    #============================FUNCTIONS=================================================================================
-    #======================================================================================================================
-
-    maj.sets.list <- function() #MAJ DES SETS
-    {
-        if(length(app.variables$fcs.files)>0)
-        {
-            lapply(1:length(app.variables$fcs.files), function(i)
-            {
-                if(length(app.variables$fcs.files[[i]]))
-                {
-                    col.id <- which(unlist(app.variables$fcs.files[[i]][["markers"]]==
-                                               input[[paste0("t_1_pop_sel_",i)]]))
-                    if(length(col.id)>0)
-                    {
-                        updateSelectInput(session, paste0("t_1_set_sel_",i), "Change Cohort",
-                                          choices = app.variables$sets.list,
-                                          selected = app.variables$fcs.files[[i]][["set"]])
-                    }
-                }
-            })
-        }
+  fixUploadedFilesNames <- function(x) {
+    if (is.null(x)) {
+      return()
     }
 
-    update.sets.list <- function(tab.id)
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs==paste0("t_",tab.id))
-        {
-            selected.set <- app.variables$sets.list
-            if(!is.na(input[[paste0("t_",tab.id,"_set_list")]]) && input[[paste0("t_",tab.id,"_set_list")]]!="")
-            {
-                selected.set <- input[[paste0("t_",tab.id,"_set_list")]]
-            }
-            updateSelectInput(session, paste0("t_",tab.id,"_set_list"), "Select a Cohort",
-                              choices=app.variables$sets.list,
-                              selected=selected.set)
-        }
-    }
+    oldNames = x$datapath
+    newNames = file.path(dirname(x$datapath),
+                         x$name)
+    file.rename(from = oldNames, to = newNames)
+    x$datapath <- newNames
+    x
+  }
+  useShinyjs()
+  #0 - App variables and Functions
+  #===================================================================
+  app.variables <- reactiveValues(
+    ref.objects = NULL, #REFERENCE OBJECTS + MODELS
+    group.objects = NULL, #GROUPS GENERATED FROM A REFERENCE / MODEL
+    temp.fcs.files = NULL,
 
-    update.files.list <- function(tab.id)
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs==paste0("t_",tab.id))
-        {
-            files.list <- list()
-            selected.file <- list()
-            if(length(input[[paste0("t_",tab.id,"_set_list")]])>0)
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input[[paste0("t_",tab.id,"_set_list")]])
-                        {
-                            files.list[[length(files.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                        }
-                    }
-                }
-            }
-            selected.file <- files.list
-            if(!is.na(input[[paste0("t_",tab.id,"_file_list")]]) && input[[paste0("t_",tab.id,"_file_list")]]!="")
-            {
-                selected.file <- as.list(unlist(input[[paste0("t_",tab.id,"_file_list")]])[input[[paste0("t_",tab.id,"_file_list")]]%in%files.list])
-            }
-            updateSelectInput(session, paste0("t_",tab.id,"_file_list"), "Select a File", choices=files.list, selected=selected.file)
-        }
-    }
+    #TP
+    TP.list = NULL,
+    TP.objects = NULL,
+    #==
 
-    init.file <- function(x, tmp.name, mark.list, pop.names = NULL, compensated=F, transformed=F)
+    #MIX
+    mix.objects = NULL,
+    #==
+
+    #Groups
+    group.objects = NULL,
+    #==
+
+    log.text = NULL,
+    init=T
+  )
+
+  env.var <- reactiveValues(
+    tool.wd = getwd(), #system.file("shinyApp", "app", package = "FCSGenerator2"),
+    zip.output = NULL
+  )
+
+
+  update.ref.sel <- function(tag.id)
+  {
+    shinyjs::disable(tag.id)
+
+    ref.names <- list(NULL=NULL)
+    if(!is.null(app.variables$ref.objects) && length(app.variables$ref.objects)>0)
     {
-        if( is.null(app.variables$fcs.files) )
+      ref.names <- 1:length(app.variables$ref.objects)
+      names(ref.names) <- sapply(1:length(app.variables$ref.objects), function(i)
+      {
+        return(app.variables$ref.objects[[i]][["Name"]])
+      })
+    }
+    updateSelectInput(session, tag.id, choices=ref.names, selected = ref.names)
+
+    delay(50, shinyjs::enable(tag.id))
+  }
+
+  update.markers.sel <- function(tag.id, ref.id)
+  {
+    shinyjs::disable(tag.id)
+    markers <- list(NULL=NULL)
+    if(!is.null(input[[ref.id]]) && length(app.variables$ref.objects)>0)
+    {
+      id <- as.numeric(input[[ref.id]])
+      if(!is.na(id) && id <= length(app.variables$ref.objects))
+      {
+        ref <- app.variables$ref.objects[[id]]
+        if(length(ref)>0)
         {
-            app.variables$fcs.files <<- list()
-            app.variables$fcs.files.backup <<- list()
-            app.variables$sets.list <<- list()
-            app.variables$populations.list <<- list()
+          ref.name <- ref$Name
+          markers <- ref$Markers
+          names(markers) <- colnames(ref$FCSG2$Expr[[1]])[markers]
         }
-        markers.default.values <- lapply(1:length(mark.list), function(i)
+      }
+    }
+    updateSelectInput(session, tag.id, choices=markers, selected = markers)
+
+    delay(50, shinyjs::enable(tag.id))
+  }
+
+  update.populations.sel <- function(tag.id, ref.id)
+  {
+    shinyjs::disable(tag.id)
+
+    populations <- list(NULL=NULL)
+    if(!is.null(input[[ref.id]]) && length(app.variables$ref.objects)>0)
+    {
+      id <- as.numeric(input[[ref.id]])
+      if(!is.na(id) && id <= length(app.variables$ref.objects))
+      {
+        ref <- app.variables$ref.objects[[id]]
+        ref.name <- ref$Name
+        if(length(ref)>0)
         {
-            return(list(mean(x@exprs[,i]), sd(x@exprs[,i])))
+          populations <- 1:length(ref$FCSG2$Expr)
+        }
+      }
+    }
+    updateSelectInput(session, tag.id, choices=populations, selected = populations)
+
+    delay(50, shinyjs::enable(tag.id))
+  }
+
+  update.populations.from.temp <- function(ref.id, tag.id)
+  {
+    shinyjs::disable(tag.id)
+
+    populations <- character(0)
+    selected.populations <- NULL
+    if(!is.null(input[[ref.id]]) && length(app.variables$ref.objects)>0)
+    {
+      id <- as.numeric(input[[ref.id]])
+      if(!is.na(id) && id <= length(app.variables$ref.objects))
+      {
+        ref <- app.variables$ref.objects[[id]]
+        ref.name <- ref$Name
+        if(length(ref)>0)
+        {
+          if(length(app.variables$temp.objects)>0 && length(app.variables$temp.objects[[ref.name]])>0)
+          {
+            ref <- app.variables$temp.objects[[ref.name]]
+          }
+          populations <- 1:length(ref$FCSG2$Expr)
+          selected.populations <- populations
+        }
+      }
+    }
+    if(!is.null(input[[tag.id]]) && input[[tag.id]]!="")
+    {
+      selected.populations <- input[[tag.id]]
+    }
+    updateSelectInput(session, tag.id, choices=populations, selected = selected.populations)
+
+    delay(50, shinyjs::enable(tag.id))
+  }
+
+
+
+  #Global UI
+  observe(
+    {
+      if(input$enable_comments)
+      {
+        shinyjs::show(selector="div.help_comment")
+      }
+
+      else
+      {
+        shinyjs::hide(selector="div.help_comment")
+      }
+    })
+
+  observe(
+    {
+      if(!is.null(app.variables$ref.objects) && length(app.variables$ref.objects)>0)
+      {
+        shinyjs::show("global_files_div")
+      }
+
+      else
+      {
+        shinyjs::hide("global_files_div")
+      }
+    })
+
+  output$global_files_list <- renderUI(
+    {
+      files.ui <- NULL
+      if(!is.null(app.variables$ref.objects) && length(app.variables$ref.objects)>0)
+      {
+        files.ui <- lapply(1:length(app.variables$ref.objects), function(i)
+        {
+          nmb.events <- sum(sapply(app.variables$ref.objects[[i]]$FCSG2$Expr, function(m){return(nrow(m))}))
+          tmp.ui <- tagList(
+            fluidRow
+            (
+              column
+              (
+                width=1,
+                checkboxInput(paste0("global_ref_object_",i,"_cb"), NULL, value = F)
+              ),
+              column
+              (
+                width=1,
+                p(app.variables$ref.objects[[i]][["GroupSize"]], style="padding-top:1vh;")
+              ),
+              column
+              (
+                width = 3,style="overflow:auto",
+                p(app.variables$ref.objects[[i]][["Name"]], style="padding-top:1vh;")
+              ),
+              column
+              (
+                width = 2,
+                p(length(app.variables$ref.objects[[i]]$FCSG2$Expr), style="padding-top:1vh")
+              ),
+              column
+              (
+                width = 2,
+                p(length(app.variables$ref.objects[[i]]$Markers), style="padding-top:1vh")
+              ),
+              column
+              (
+                width = 3,
+                p(nmb.events, style="padding-top:1vh")
+              )
+            )
+          )
+          return(tmp.ui)
         })
-        pop.col <- ncol(x@exprs)
-        pop.list <- sort(as.numeric(unique(x@exprs[,pop.col])))
-        pop.events.ids <- list()
-        if(length(pop.list)<100)
+      }
+      return(files.ui)
+    })
+
+  observeEvent(input$global_files__rm,
+               {
+                 shinyjs::disable(paste0("global_files_rm"))
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   selected.files <- NULL
+                   for(i in 1:length(app.variables$ref.objects))
+                   {
+                     if(input[[paste0("global_ref_object_",i,"_cb")]])
+                     {
+                       selected.files <- c(selected.files, i)
+                     }
+                   }
+                   if(length(selected.files)>0)
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Removing Files", value = 0)
+                     for(i in selected.files)
+                     {
+                       ref.object <- app.variables$ref.objects[[i]]
+                       if(length(ref.object)>0)
+                       {
+                         if(ref.object$Name%in%names(app.variables$temp.objects))
+                         {
+                           id <- which(names(app.variables$temp.objects)==ref.object$Name)[[1]]
+                           app.variables$temp.objects <- app.variables$temp.objects[-id]
+                         }
+                         if(ref.object$Name%in%names(app.variables$group.objects))
+                         {
+                           id <- which(names(app.variables$group.objects)==ref.object$Name)[[1]]
+                           app.variables$group.objects <- app.variables$group.objects[-id]
+                         }
+                         progress$inc(1/length(selected.files), detail=paste0(ref.object$Name, " removed"))
+                       }
+                     }
+                     if(length(app.variables$ref.objects)==length(selected.files))
+                     {
+                       app.variables$ref.objects <- NULL
+                     }
+                     else
+                     {
+                       app.variables$ref.objects <- app.variables$ref.objects[-selected.files]
+                     }
+                     progress$set(message = "Files Removed", value=1)
+                     delay(500, progress$close())
+                   }
+                 }
+                 delay(500, shinyjs::enable(paste0("global_files_rm")))
+               })
+
+  observeEvent(input$global_files_sel_all,
+               {
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   for(i in 1:length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[i]]
+                     if(length(ref)>0)
+                     {
+                       updateCheckboxInput(session, paste0("global_ref_object_",i,"_cb"), value = T)
+                     }
+                   }
+                 }
+               })
+
+  observeEvent(input$global_files_desel_all,
+               {
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   for(i in 1:length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[i]]
+                     if(length(ref)>0)
+                     {
+                       updateCheckboxInput(session, paste0("global_ref_object_",i,"_cb"), value = F)
+                     }
+                   }
+                 }
+               })
+  #===================================================================
+
+
+
+
+
+  #1 - Add Reference Files
+  #===================================================================
+  observe( #UPDATE DEFAULT FILENAME
+    {
+      if(input$t_1_generated_name == "filename" || input$t_1_generated_name == paste0("model",length(app.variables$ref.objects)))
+      {
+        updateTextInput(session, "t_1_generated_name", value="model")
+      }
+    })
+
+  observeEvent(input$t_1_files_rm, #DELETE REFERENCE FILES
+               {
+                 shinyjs::disable("t_1_files_rm")
+                 if(length(input$t_1_files_rm_sel)>0 && !is.null(input$t_1_files_rm_sel))
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Removing Files", value = 0)
+                   ids <- as.numeric(input$t_1_files_rm_sel)
+                   for(i in ids)
+                   {
+                     ref.object <- app.variables$ref.objects[[i]]
+                     if(length(ref.object)>0)
+                     {
+                       if(ref.object$Name%in%names(app.variables$temp.objects))
+                       {
+                         id <- which(names(app.variables$temp.objects)==ref.object$Name)[[1]]
+                         app.variables$temp.objects <- app.variables$temp.objects[-id]
+                       }
+                       if(ref.object$Name%in%names(app.variables$shift.objects))
+                       {
+                         id <- which(names(app.variables$shift.objects)==ref.object$Name)[[1]]
+                         app.variables$shift.objects <- app.variables$shift.objects[-id]
+                       }
+                       if(ref.object$Name%in%names(app.variables$TP.objects))
+                       {
+                         id <- which(names(app.variables$TP.objects)==ref.object$Name)[[1]]
+                         app.variables$TP.objects <- app.variables$TP.objects[-id]
+                       }
+                       if(ref.object$Name%in%names(app.variables$mix.objects))
+                       {
+                         id <- which(names(app.variables$mix.objects)==ref.object$Name)[[1]]
+                         app.variables$mix.objects <- app.variables$mix.objects[-id]
+                       }
+                       progress$inc(1/length(ids), detail=paste0(ref.object$Name, " removed"))
+                     }
+                   }
+                   if(length(app.variables$ref.objects)==length(ids))
+                   {
+                     app.variables$ref.objects <- NULL
+                   }
+                   else
+                   {
+                     app.variables$ref.objects <- app.variables$ref.objects[-ids]
+                   }
+                   progress$set(message = "Files Removed", value=1)
+                   delay(500, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_1_files_rm"))
+               })
+
+  output$t_1_pop_list <- renderUI(
+    {
+      pop.ui <- list()
+      if(as.numeric(input$t_1_nmb_populations)>0)
+      {
+        pop.ui <- lapply(1:(as.numeric(input$t_1_nmb_populations)), function(i)
         {
-            pop.events.ids <- lapply(1:length(pop.list), function(i)
+          effective.perc <- 100
+          val <- tagList(
+            column(
+              width=1
+            ),
+            column(
+              width=2,
+              p(i, style="padding-top:10%")
+            ),
+            column(
+              width=4,
+              numericInput(paste0("t_1_pop_",i,"min__freq"), NULL,
+                           value = trunc(effective.perc/as.numeric(input$t_1_nmb_populations)*100)/100)
+            ),
+            column(
+              width=5,
+              numericInput(paste0("t_1_pop_",i,"max__freq"), NULL,
+                           value = trunc(effective.perc/as.numeric(input$t_1_nmb_populations)*100)/100+1)
+            )
+          )
+          return(val)
+        })
+        pop.ui <- tagList(
+          tagList(
+            column(
+              width=3,
+              p(tags$b("Population ID"))
+            ),
+            column(
+              width=4,
+              p(tags$b("Min Frequency"))
+            ),
+            column(
+              width=5,
+              p(tags$b("Max Frequency"))
+            )
+          ),
+          pop.ui
+        )
+        return(pop.ui)
+      }
+      return(pop.ui)
+    })
+
+  output$t_1_files_main <- renderUI(
+    {
+      files.ui <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        files.ui <- lapply(1:length(app.variables$ref.objects), function(id)
+        {
+          ref.object <- app.variables$ref.objects[[id]]
+          pop.col <- ref.object$AnnotationColumn
+          #==
+          visualized.markers <- ref.object$Markers
+          names(visualized.markers) <- colnames(ref.object$Expr[[1]])[visualized.markers]
+          #==
+          tmp.ui <- tagList(
+            div(
+              id=paste0("t_1_ref_",id,"_fr"),
+              shinydashboard::box(
+                width = 12, collapsible=T, style="min-height:15vh", collapsed = T,
+                title = ref.object$Name,
+                style="padding-left:5%",
+                plotlyOutput(paste0("t_1_file_",id), width = "100%")
+              )
+            )
+          )
+
+          markers <- ref.object$Markers
+          annotation.column <- ref.object$AnnotationColumn
+
+          pop.mat <- matrix(nrow=length(ref.object$FCSG2$Expr), ncol=length(ref.object$Markers))
+          colnames(pop.mat) <- colnames(ref.object$FCSG2$Expr[[1]])[markers]
+          rownames(pop.mat) <- rep("", nrow(pop.mat))
+
+          for(i in 1:length(ref.object$FCSG2$Expr))
+          {
+            mat.means <- ref.object$FCSG2$Positions[[i]][[1]]
+            rownames(pop.mat)[i] <- ref.object$FCSG2$Expr[[i]][1,annotation.column]
+            for(j in markers)
             {
-                return(unlist(which(x@exprs[,pop.col]==pop.list[[i]])))
-            })
-            if(is.null(pop.names))
-            {
-                names(pop.events.ids) <- 1:length(pop.list)
+              pop.mat[i,j] <- mat.means[[j]]
             }
-            else
+          }
+
+          pop.plot <- heatmaply(pop.mat, Rowv = T, Colv="Rowv", dendrogram = "none", limits = c(-0.5,4.5))
+          output[[paste0("t_1_file_",id)]] <- renderPlotly(pop.plot)
+
+          return(tmp.ui)
+        })
+      }
+      return(files.ui)
+    })
+
+  observeEvent(input$t_1_create,  #CREATE FILES
+               {
+                 shinyjs::disable("t_1_create")
+                 if(as.numeric(input$t_1_nmb_files)>0)
+                 {
+                   nmb.files <- as.numeric(input$t_1_nmb_files)
+                   nmb.populations <- as.numeric(input$t_1_nmb_populations)
+                   nmb.events <- as.numeric(input$t_1_nmb_events)
+                   nmb.markers <- as.numeric(input$t_1_nmb_markers)
+
+                   if(nmb.populations>0 & nmb.events>0 & nmb.markers>0)
+                   {
+                     if(nmb.populations > 2^nmb.markers)
+                     {
+                       tmp.message <- paste("Error: to generate", nmb.populations, "populations, you need at least",
+                                            as.integer(log(nmb.populations,2))+1, "markers")
+                       showNotification(tmp.message, duration = 5, type="error")
+                     }
+                     else
+                     {
+                       progress <- Progress$new()
+                       progress$set(message = "Generating Files", value = 0)
+                       # update.log("GENERATING FILES")
+                       nmb.markers <- input$t_1_nmb_markers
+                       pop.names <- lapply(1:nmb.populations, function(pop)
+                       {
+                         return(input[[paste0("t_1_pop_",pop,"_name")]])
+                       })
+
+
+                       min.freq.list <- sapply(1:nmb.populations, function(i)
+                       {
+                         return(as.numeric(input[[paste0("t_1_pop_",i,"min__freq")]]))
+                       })
+
+                       max.freq.list <- sapply(1:nmb.populations, function(i)
+                       {
+                         return(as.numeric(input[[paste0("t_1_pop_",i,"max__freq")]]))
+                       })
+                       if(!(sum(min.freq.list)<=100 && sum(max.freq.list)>=100))
+                       {
+                         progress$close()
+                         if(sum(min.freq.list)>100)
+                         {
+                           showNotification("The Sum of the min frequencies must be equal or lower to 100", duration = 5, type="error")
+                         }
+                         if(sum(max.freq.list)<100)
+                         {
+                           showNotification("The Sum of the max frequencies must be greater or equal to 100", duration = 5, type="error")
+                         }
+                       }
+                       else
+                       {
+                         for(current.file in 1:nmb.files)
+                         {
+                           tmp.name <- input$t_1_generated_name
+                           if(is.null(tmp.name) || is.na(tmp.name))
+                           {
+                             tmp.name <- paste0("GEN__",nmb.events,"_",
+                                                nmb.markers,"_",nmb.populations)
+                           }
+                           tmp.name <- paste0(tmp.name, "_", current.file)
+
+                           x <- generate.FCSG2(nmb.events, nmb.markers, nmb.populations, min.freq.list, max.freq.list)
+                           if(length(app.variables$ref.objects)==0)
+                           {
+                             app.variables$ref.objects <- list()
+                           }
+                           app.variables$ref.objects <- list.append(app.variables$ref.objects,
+                                                                    as.list(list("FCSG2"=x,
+                                                                                 "Transformed"=T,
+                                                                                 "Compensated"=T,
+                                                                                 "Name"=tmp.name,
+                                                                                 "AnnotationColumn"=nmb.markers+2,
+                                                                                 "Markers"=c(1:nmb.markers),
+                                                                                 "GroupSize"=1)))
+
+
+                           progress$inc(1/nmb.files, detail = paste(tmp.name, "generated"))
+                           # update.log(paste("========", tmp.name, "generated"))
+                         }
+                         progress$set(message = "Files generated", value = 1)
+                         # update.log("======== FILES GENERATED")
+                         # update.log("")
+                         delay(700, progress$close())
+                       }
+                     }
+                   }
+                 }
+
+                 delay(500, shinyjs::enable("t_1_create"))
+               })
+
+  observeEvent(input$t_1_select,  #SELECT FILES
+               {
+                 shinyjs::disable("t_1_select")
+                 m <- matrix(nrow=1,ncol=2)
+                 m[1,1] = "FlowFrames"
+                 m[1,2] = "*.csv;*.fcs"
+                 #==
+                 #temp.files <- tk_choose.files(filters = m,multi = T)
+                 added_files <- fixUploadedFilesNames(input$t_1_select)
+                 temp.files <- added_files$datapath
+                 if(length(temp.files) > 0)
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Loading Files", value = 0)
+                   # update.log("LOADING Files")
+                   lapply(temp.files, function(f)
+                   {
+                     l <- length(f)
+                     x <- NULL
+                     mark.list <- list()
+                     if(grepl("csv",f))
+                     {
+                       x <- as.matrix(read.csv(f))
+                       x <- flowFrame(x)
+                       lapply(1:ncol(x@exprs), function(i)
+                       {
+                         nx <- x@description[[paste0("$P",i,"S")]]
+                         if(!is.null(nx) && !is.na(nx) && nx != "" && nx != " ")
+                         {
+                           mark.list[[i]] <<- nx
+                         }
+                         else
+                         {
+                           mark.list[[i]] <<- colnames(x)[i]
+                         }
+                       })
+                     }
+                     else
+                     {
+                       x <- read.FCS(f,emptyValue = FALSE)
+                       lapply(1:ncol(x@exprs), function(i)
+                       {
+                         nx <- x@description[[paste0("$P",i,"S")]]
+                         if(!is.null(nx) && !is.na(nx) && nx != "" && nx != " ")
+                         {
+                           mark.list[[i]] <<- nx
+                         }
+                         else
+                         {
+                           mark.list[[i]] <<- colnames(x)[i]
+                         }
+                       })
+                     }
+
+                     tmp.name <- paste0(basename(substr(f,1,nchar(f)-4)))
+                     progress$inc(1/length(temp.files), detail = paste(f, "loaded"))
+                     if(length(app.variables$temp.fcs.files)>0)
+                     {
+                       app.variables$temp.fcs.files[[length(app.variables$temp.fcs.files)+1]] <- list("FCS"=x,
+                                                                                                      "Name"=tmp.name)
+                     }
+                     else
+                     {
+                       app.variables$temp.fcs.files <- list()
+                       app.variables$temp.fcs.files[[1]] <- list("FCS"=x,
+                                                                 "Name"=tmp.name)
+                     }
+                     # update.log(paste("========",f, "loaded"))
+                   })
+                   progress$set(message = "Files loaded", value = 1)
+                   # update.log("======== FILES LOADED")
+                   # update.log("")
+                   delay(700, progress$close())
+                 }
+                 else
+                 {
+                   showNotification("NO FILES SELECTED", duration=5, type="error")
+                 }
+
+                 delay(500, shinyjs::enable("t_1_select"))
+               })
+
+  output$t_1_fcs_list <- renderUI(
+    {
+      fcs.ui <- list()
+      if(length(app.variables$temp.fcs.files)>0)
+      {
+        shinyjs::show("t_1_validate")
+        shinyjs::enable("t_1_validate")
+        fcs.ui <- lapply(1:length(app.variables$temp.fcs.files), function(i)
+        {
+          x <- app.variables$temp.fcs.files[[i]]
+          markers <- 1:ncol(x[["FCS"]]@exprs)
+          names(markers) <- colnames(x[["FCS"]]@exprs)
+
+          tmp.name <- x$Name
+          if(!is.null(input[[paste0("t_1_imported_name_",i)]]) && !is.na(input[[paste0("t_1_imported_name_",i)]]))
+          {
+            tmp.name <- input[[paste0("t_1_imported_name_",i)]]
+          }
+          val <- tagList(
+            fluidRow
+            (
+              style="min-height:10vh",
+              column
+              (
+                width=12,
+                column(
+                  width=4,
+                  textInput(paste0("t_1_imported_name_",i), "Filename", value=tmp.name)
+                ),
+                column(
+                  width=4,
+                  selectInput(paste0("t_1_fcs_",i,"_annotation_column"), "Annotation Column", multiple = F, choices=markers)
+                ),
+                column(
+                  width=4,
+                  selectInput(paste0("t_1_fcs_",i,"_markers_list"), "Markers List", multiple = T, choices=markers, selected = markers)
+                )
+              )
+            )
+          )
+          return(val)
+        })
+      }
+      else
+      {
+        shinyjs::hide("t_1_validate")
+        shinyjs::disable("t_1_validate")
+      }
+      return(fcs.ui)
+    })
+
+  observeEvent(input$t_1_fcs_validate,
+               {
+                 shinyjs::disable("t_1_fcs_validate")
+                 if(length(app.variables$temp.fcs.files)>0)
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Importing FCS Files", value = 0)
+
+                   nmb.files <- isolate(length(app.variables$temp.fcs.files))
+                   for(i in 1:nmb.files)
+                   {
+                     fcs.obj <- app.variables$temp.fcs.files[[nmb.files-i+1]]
+                     annotation.column <- as.numeric(input[[paste0("t_1_fcs_",i,"_annotation_column")]])
+                     markers.list <- as.numeric(input[[paste0("t_1_fcs_",i,"_markers_list")]])
+                     if(!is.null(annotation.column) & length(markers.list)>0)
+                     {
+                       x <- load.annotated.FCS.as.object(fcs.obj$FCS, annotation.column, markers.list)
+                       if(!is.null(x))
+                       {
+                         if(length(app.variables$ref.objects)==0)
+                         {
+                           app.variables$ref.objects <- list()
+                         }
+                         tmp.name <- input[[paste0("t_1_imported_name_",i)]]
+                         if(is.null(tmp.name) || is.na(tmp.name))
+                         {
+                           tmp.name <- fcs.obj$Name
+                         }
+                         app.variables$ref.objects <- list.append(app.variables$ref.objects,
+                                                                  as.list(list("FCSG2"=x,
+                                                                               "Transformed"=F,
+                                                                               "Compensated"=F,
+                                                                               "Name"=tmp.name,
+                                                                               "AnnotationColumn"=annotation.column,
+                                                                               "Markers"=markers.list,
+                                                                               "GroupSize"=1)))
+                         if(length(app.variables$temp.fcs.files)>1)
+                         {
+                           app.variables$temp.fcs.files <- app.variables$temp.fcs.files[-(nmb.files-i+1)]
+                         }
+                         else
+                         {
+                           app.variables$temp.fcs.files <- NULL
+                         }
+                       }
+                       else
+                       {
+                         showNotification("The file was empty. Please Select a different Annotation Column and make sure it is not in the markers list",
+                                          duration = 5, type="error")
+                       }
+                     }
+
+                     progress$inc(1/length(app.variables$temp.fcs.files), detail = paste(fcs.obj$Name, "imported"))
+                   }
+                   progress$set(message = "FCS files imported", value = 1)
+                   delay(700, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_1_fcs_validate"))
+               })
+  #===================================================================
+
+
+
+
+
+
+  #2 - Compensate, Transform
+  #===================================================================
+  output$t_2_files <- renderUI(
+    {
+      files.ui <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        files.ui <- lapply(1:length(app.variables$ref.objects), function(i)
+        {
+          tmp.ui <- NULL
+
+          ref <- app.variables$ref.objects[[i]]
+          if(length(ref)>0)
+          {
+            comp <- p("False", style="color:red")
+            if(ref$Compensated)
             {
-                names(pop.events.ids) <- pop.names
+              comp <- p("True", style="color:green")
             }
-        }
-
-
-        app.variables$fcs.files[[tmp.name]] <<- list()
-        app.variables$fcs.files[[tmp.name]][["file"]] <<- x
-        app.variables$fcs.files[[tmp.name]][["markers"]] <<- mark.list
-        app.variables$fcs.files[[tmp.name]][["name"]] <<- tmp.name
-        app.variables$fcs.files[[tmp.name]][["type"]] <<- "SRC"
-        app.variables$fcs.files[[tmp.name]][["mutant_ui"]] <<- TRUE
-        app.variables$fcs.files[[tmp.name]][["set"]] <<- tmp.name
-        app.variables$fcs.files[[tmp.name]][["markers_default_values"]] <<- list()
-        app.variables$fcs.files[[tmp.name]][["populations_column"]] <<- ncol(x@exprs)
-        app.variables$fcs.files[[tmp.name]][["source_ctrl"]] <<- tmp.name
-        app.variables$fcs.files[[tmp.name]][["comp"]] <<- compensated
-        app.variables$fcs.files[[tmp.name]][["transf"]] <<- transformed
-        #==
-        app.variables$output.matrices[[tmp.name]] <<- x@exprs
-        #==
-        app.variables$used.events[[tmp.name]] <<- rep(T,nrow(x@exprs))
-        #==
-        app.variables$sets.list[[length(app.variables$sets.list)+1]] <<- tmp.name
-        #==
-        app.variables$populations.list[[tmp.name]] <<- pop.events.ids
-        #==
-        app.variables$reduction.percentages[[tmp.name]] <<- list()
-
-        # file.vec <- matrix(ncol=5,nrow=1)
-        # file.vec[1,1] <- paste0(basename(substr(f,1,nchar(f)-4)), "_", length(app.variables$fcs.files)-1)
-        # file.vec[1,2] <- trunc(file.size(f)/1024/1024*1000)/1000
-        # file.vec[1,3] <- ncol(x)
-        # file.vec[1,4] <- nrow(x)
-        # file.vec[1,5] <- nrow(x)
-        #
-        # app.variables$file.info.table <<- rbind(app.variables$file.info.table,
-        #                                         file.vec)
-    }
-
-    update.log <- function(text)
-    {
-        app.variables$log.text <- paste(app.variables$log.text, text, sep = "\n")
-    }
-
-    list.to.string <- function(list)
-    {
-        new.string <- ""
-        for(i in 1:length(list))
-        {
-            new.string <- paste(new.string, list[[i]], sep=", ")
-        }
-        return(new.string)
-    }
-
-
-    #======================================================================================================================
-    #===============================CODE===================================================================================
-    #======================================================================================================================
-
-    #=======================================LOAD FILES===================================================
-
-    observeEvent(input$t_1_select,  #SELECT FILES
-    {
-        shinyjs::disable("t_1_select")
-        m <- matrix(nrow=1,ncol=2)
-        m[1,1] = "FlowFrames"
-        m[1,2] = "*.csv;*.fcs"
-        #==
-        temp.files <- choose.files(filters = m,multi = T)
-
-        if(length(temp.files) > 0)
-        {
-            progress <- Progress$new()
-            progress$set(message = "Loading Files", value = 0)
-            update.log("LOADING Files")
-            lapply(temp.files, function(f)
+            transf <- p("False", style="color:red")
+            if(ref$Transformed)
             {
-                l <- length(f)
-                x <- NULL
-                mark.list <- list()
-                if(grepl("csv",f))
-                {
-                    x <- as.matrix(read.csv(f))
-                    x <- flowFrame(x)
-                    lapply(1:ncol(x@exprs), function(i)
-                    {
-                        nx <- x@description[[paste0("$P",i,"S")]]
-                        if(!is.null(nx) && !is.na(nx) && nx != "" && nx != " ")
-                        {
-                            mark.list[[i]] <<- nx
-                        }
-                        else
-                        {
-                            mark.list[[i]] <<- colnames(x)[i]
-                        }
-                    })
-                }
-                else
-                {
-                    x <- read.FCS(f,emptyValue = FALSE)
-                    lapply(1:ncol(x@exprs), function(i)
-                    {
-                        nx <- x@description[[paste0("$P",i,"S")]]
-                        if(!is.null(nx) && !is.na(nx) && nx != "" && nx != " ")
-                        {
-                            mark.list[[i]] <<- nx
-                        }
-                        else
-                        {
-                            mark.list[[i]] <<- colnames(x)[i]
-                        }
-                    })
-                }
+              transf <- p("True", style="color:green")
+            }
 
-                tmp.name <- paste0(basename(substr(f,1,nchar(f)-4)),"_",length(app.variables$fcs.files))
-                init.file(x, tmp.name, mark.list)
-                progress$inc(1/length(temp.files), detail = paste(f, "loaded"))
-                update.log(paste("========",f, "loaded"))
-            })
-            progress$set(message = "Files loaded", value = 1)
-            update.log("======== FILES LOADED")
-            update.log("")
-            delay(700, progress$close())
+            tmp.ui <- tagList(
+              fluidRow
+              (
+                style="margin-bottom:2%",
+                column
+                (
+                  width=2,
+                  checkboxInput(paste0("t_2_file_",i), "", value = F)
+                ),
+                column
+                (
+                  width=4,
+                  h5(ref$Name)
+                ),
+                column
+                (
+                  width=3,
+                  tags$b(comp)
+                ),
+                column
+                (
+                  width=3,
+                  tags$b(transf)
+                )
+              )
+            )
+          }
+
+          return(tmp.ui)
+        })
+      }
+
+      return(files.ui)
+    })
+
+  output$t_2_transform_param <- renderUI(
+    {
+      param.ui <- NULL
+      if(!is.null(input$t_2_transform_sel) && as.integer(input$t_2_transform_sel) == 2)
+      {
+        param.ui <- numericInput("t_2_arcsinh_w", "W", value=5)
+      }
+      return(param.ui)
+    })
+
+  observeEvent(input$t_2_compensate,
+               {
+                 shinyjs::disable("t_2_compensate")
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Compensating Selection", value = 0)
+
+                   selected.ref <- sapply(1:length(app.variables$ref.objects), function(i)
+                   {
+                     return(as.logical(input[[paste0("t_2_file_",i)]]))
+                   })
+
+                   selected.ref <- unlist(which(selected.ref))
+                   if(length(selected.ref)>0)
+                   {
+                     for(i in selected.ref)
+                     {
+                       ref <- app.variables$ref.objects[[i]]
+                       if(length(ref)>0)
+                       {
+                         tmp.fcs <- save.object.as.FCS(ref$FCSG2)
+                         tmp.fcs <- m.compensate(tmp.fcs)
+                         tmp.obj <- load.annotated.FCS.as.object(fcs = tmp.fcs, annotation.column = ref$AnnotationColumn, markers.list = ref$Markers)
+
+                         app.variables$ref.objects[[i]]$FCSG2 <- tmp.obj
+                         app.variables$ref.objects[[i]]$Compensated <- T
+                         progress$inc(1/length(selected.ref), detail=paste0(ref$Name, " compensated"))
+                       }
+                     }
+                   }
+                   progress$set(message = "Files compensated", value = 1)
+                   shinyjs::delay(500, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_2_compensate"))
+               })
+
+  observeEvent(input$t_2_transform,
+               {
+                 shinyjs::disable("t_2_transform")
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Transforming Selection", value = 0)
+                   selected.ref <- sapply(1:length(app.variables$ref.objects), function(i)
+                   {
+                     return(as.logical(input[[paste0("t_2_file_",i)]]))
+                   })
+
+                   selected.ref <- unlist(which(selected.ref))
+                   if(length(selected.ref)>0)
+                   {
+                     for(i in selected.ref)
+                     {
+                       ref <- app.variables$ref.objects[[i]]
+                       if(length(ref)>0)
+                       {
+                         tmp.fcs <- save.object.as.FCS(ref$FCSG2)
+                         if(!is.null(input$t_2_transform_sel))
+                         {
+                           if(as.integer(input$t_2_transform_sel) == 1)
+                           {
+                             tmp.fcs <- m.transform.logicle(tmp.fcs, colnames(ref$FCSG2$Expr[[1]])[ref$Markers])
+                           }
+                           else if(as.integer(input$t_2_transform_sel) == 2)
+                           {
+                             w <- as.numeric(input[["t_2_arcsinh_w"]])
+                             tmp.fcs <- m.transform.asinh(tmp.fcs, colnames(ref$FCSG2$Expr[[1]])[ref$Markers], w)
+                           }
+                         }
+                         tmp.obj <- load.annotated.FCS.as.object(fcs = tmp.fcs, annotation.column = ref$AnnotationColumn, markers.list = ref$Markers)
+
+                         app.variables$ref.objects[[i]]$FCSG2 <- tmp.obj
+                         app.variables$ref.objects[[i]]$Transformed <- T
+                         progress$inc(1/length(selected.ref), detail=paste0(ref$Name, " transformed"))
+                       }
+                     }
+                   }
+                   progress$set(message = "Files Transformed", value = 1)
+                   shinyjs::delay(500, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_2_compensate"))
+               })
+
+  observe( #SELECT ALL
+    {
+      if(length(app.variables$ref.objects)>0)
+      {
+        if(as.logical(input$t_2_file_select_all))
+        {
+          for(i in 1:length(app.variables$ref.objects))
+          {
+            updateCheckboxInput(session, paste0("t_2_file_",i), value = T)
+          }
         }
         else
         {
-            showNotification("NO FILES SELECTED", duration=5, type="error")
+          for(i in 1:length(app.variables$ref.objects))
+          {
+            updateCheckboxInput(session, paste0("t_2_file_",i), value = F)
+          }
         }
-
-        maj.sets.list()
-        delay(500, shinyjs::enable("t_1_select"))
+      }
     })
+  #===================================================================
 
-    observeEvent(input$t_1_create,  #CREATE FILES
+
+
+
+
+
+  #3.1 - Generate Model (POP MODIFICATION)
+  #===================================================================
+  output$t_3_pop_ui <- renderUI( #UI BODY
     {
-        shinyjs::disable("t_1_create")
-        if(length(input$t_1_nmb_files)>0 && !is.na(input$t_1_nmb_files) &&
-           as.numeric(input$t_1_nmb_files)>0)
+      body.ui <- NULL
+      if(!is.null(input$t_3_pop_ref_sel))
+      {
+        id <- as.numeric(input$t_3_pop_ref_sel)
+        ref <- app.variables$ref.objects[[id]]
+
+        if(length(ref)>0)
         {
-            if(length(input$t_1_nmb_populations)>0 && !is.na(input$t_1_nmb_populations) &&
-               as.numeric(input$t_1_nmb_populations)>0)
+          ref.name <- ref$Name
+          if(length(app.variables$temp.objects)==0)
+          {
+            app.variables$temp.objects <- list()
+          }
+          if( !ref.name%in%names(app.variables$temp.objects) )
+          {
+            app.variables$temp.objects[[ref.name]] <- ref
+
+            app.variables$temp.objects[[ref.name]]$OriginExpr <-
+              lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+            app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+          }
+          ref <- app.variables$temp.objects[[ref.name]]
+
+          annotation.column <- ref$AnnotationColumn
+          markers <- as.numeric(input$t_3_pop_move_markers_sel)
+          population <- as.numeric(input$t_3_pop_move_pop_sel)
+
+          body.ui <- lapply(markers, function(i)
+          {
+            pos.m <- ref$FCSG2$Positions[[population]][[1]][[i]]
+            pos.sd <- ref$FCSG2$Positions[[population]][[2]][[i]]
+
+            collapsed <- T
+            if(i==markers[[length(markers)]])
             {
-                if(length(input$t_1_nmb_markers)>0 && !is.na(input$t_1_nmb_markers) &&
-                   as.numeric(input$t_1_nmb_markers)>0)
-                {
-                    if(length(input$t_1_nmb_events)>0 && !is.na(input$t_1_nmb_events) &&
-                       as.numeric(input$t_1_nmb_events)>0)
-                    {
-                        if(length(input$t_1_nmb_rare_populations)>0 && !is.na(input$t_1_nmb_rare_populations) &&
-                           as.numeric(input$t_1_nmb_rare_populations)>=0)
-                        {
-                            if(length(input$t_1_freq_rare_populations)>0 && !is.na(input$t_1_freq_rare_populations) &&
-                               as.numeric(input$t_1_freq_rare_populations)>=0)
-                            {
-                                progress <- Progress$new()
-                                progress$set(message = "Generating Files", value = 0)
-                                update.log("GENERATING FILES")
-
-                                nmb.files <- input$t_1_nmb_files
-                                nmb.events <- input$t_1_nmb_events
-                                nmb.markers <- input$t_1_nmb_markers
-                                nmb.populations <- input$t_1_nmb_populations
-                                nmb.rare.populations <- input$t_1_nmb_rare_populations
-                                rare.pop.freq <- input$t_1_freq_rare_populations
-                                pop.names <- lapply(1:(nmb.populations-nmb.rare.populations), function(pop)
-                                {
-                                    return(input[[paste0("t_1_pop_",pop,"_name")]])
-                                })
-                                tmp.freq <- c()
-                                if(nmb.rare.populations>0)
-                                {
-                                    pop.names <- list(unlist(pop.names),
-                                                      paste0("MIN_POP_", 1:nmb.rare.populations))
-
-                                    tmp.freq <- c(1, sort(sample(2:(as.integer(nmb.events*rare.pop.freq/100)-1), 3)),
-                                                  as.integer(nmb.events*rare.pop.freq/100))
-                                }
-
-                                min.freq.list <- sapply(1:nmb.populations, function(i)
-                                {
-                                    if(i<=(nmb.populations-nmb.rare.populations))
-                                    {
-                                        return(as.numeric(input[[paste0("t_1_pop_",i,"min__freq")]]))
-                                    }
-                                    else
-                                    {
-                                        tmp.val <- (tmp.freq[i-nmb.populations+nmb.rare.populations+1] -
-                                            tmp.freq[i-nmb.populations+nmb.rare.populations]+1)/nmb.events
-                                        return(tmp.val)
-                                    }
-                                })
-
-                                max.freq.list <- sapply(1:nmb.populations, function(i)
-                                {
-                                    if(i<=(nmb.populations-nmb.rare.populations))
-                                    {
-                                        return(as.numeric(input[[paste0("t_1_pop_",i,"max__freq")]]))
-                                    }
-                                    else
-                                    {
-                                        tmp.val <- (tmp.freq[i-nmb.populations+nmb.rare.populations+1] -
-                                                        tmp.freq[i-nmb.populations+nmb.rare.populations]+1)/nmb.events*100
-                                        return(tmp.val)
-                                    }
-                                })
-
-                                for(current.file in 1:nmb.files)
-                                {
-                                    tmp.name <- paste0("GEN_",current.file,"__",nmb.events,"_",
-                                                       nmb.markers,"_",nmb.populations,"_",nmb.rare.populations,"_",
-                                                       trunc(as.numeric(Sys.time())))
-                                    x <- generate.fcs(nmb.events,nmb.markers,nmb.populations,nmb.rare.populations,rare.pop.freq,
-                                                      min.freq.list,max.freq.list)
-                                    if(!is.null(x))
-                                    {
-                                        mark.list <- colnames(x@exprs)
-                                        pop.names <- unlist(pop.names)
-                                        init.file(x, tmp.name, mark.list, pop.names = pop.names, compensated = T, transformed = T)
-                                    }
-                                    progress$inc(1/nmb.files, detail = paste(tmp.name, "generated"))
-                                    update.log(paste("========", tmp.name, "generated"))
-                                }
-                                progress$set(message = "Files generated", value = 1)
-                                update.log("======== FILES GENERATED")
-                                update.log("")
-                                delay(700, progress$close())
-                            }
-                        }
-                    }
-                }
+              collapsed <- F
             }
+
+            tmp.ui <- tagList(
+              column(
+                width=6,
+                h4(colnames(ref$FCSG2$Expr[[1]])[i]),
+
+                fluidRow(
+                  width=12,
+                  column(
+                    width=12,
+                    plotOutput(paste0("move_",i,"_plot"))
+                  ),
+                  column(
+                    width=12,
+                    sliderInput(paste0("move_",i,"_plot_m"), "Mean", min = -0.5, max=4.5, value = pos.m, step = 0.01)
+                  ),
+                  column(
+                    width=12,
+                    sliderInput(paste0("move_",i,"_plot_sd"), "SD", min = 0, max=0.8, value = pos.sd, step = 0.0002)
+                  )
+                )
+              )
+            )
+
+            return(tmp.ui)
+          })
         }
-        delay(500, shinyjs::enable("t_1_create"))
+      }
+
+      return(body.ui)
     })
 
-    # file.table.fct <- function() #FILES INFORMATION TABLE - UPDATE
-    # {
-    #     tmp.mat <- app.variables$file.info.table
-    #     l <- ncol(tmp.mat)
-    #     if(length(l)>0 && l==1)
-    #     {
-    #         tmp.mat <- t(tmp.mat)
-    #         colnames(app.variables$file.info.table) <<- c("Filename", "Size (Mo)", "Number of markers", "Number of events", "Subsample", "TYPE")
-    #     }
-    #
-    #     return(tmp.mat)
-    # }
-    #
-    # output$t_1_fileInfo <- renderTable(file.table.fct()) #FILES INFORMATION
 
-    output$t_1_files_main <- renderUI(  #CREATION DE L'UI DE CHAQUE FICHIER ET OBSERVE EVENT SUR LA CREATION DES SETS
+
+  #GENERATE AND UPDATE THE PLOTS
+  observeEvent(input$t_3_pop_move_pop_sel,
+               {
+                 if(!is.null(input$t_3_pop_ref_sel))
+                 {
+                   id <- as.numeric(input$t_3_pop_ref_sel)
+                   if(!is.null(id) && !is.na(id) && id <= length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[id]]
+
+                     if(length(ref)>0)
+                     {
+                       ref.name <- ref$Name
+                       if(length(app.variables$temp.objects)==0)
+                       {
+                         app.variables$temp.objects <- list()
+                       }
+                       if( !ref.name%in%names(app.variables$temp.objects) )
+                       {
+                         app.variables$temp.objects[[ref.name]] <- ref
+
+                         app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                           lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+                         app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+                       }
+                       ref <- app.variables$temp.objects[[ref.name]]
+
+                       annotation.column <- ref$AnnotationColumn
+                       markers <- as.numeric(input$t_3_pop_move_markers_sel)
+                       population <- as.numeric(input$t_3_pop_move_pop_sel)
+                       if(!is.null(population) && !is.na(population) && population <= length(ref$FCSG2$Positions))
+                       {
+                         body.ui <- lapply(markers, function(i)
+                         {
+                           pos.m <- ref$FCSG2$Positions[[population]][[1]][[i]]
+                           pos.sd <- ref$FCSG2$Positions[[population]][[2]][[i]]
+
+                           if( length(pos.m)>0 && length(pos.sd)>0 )
+                           {
+                             updateSliderInput(session, paste0("move_",i,"_plot_m"), value=pos.m)
+                             updateSliderInput(session, paste0("move_",i,"_plot_sd"), value=pos.sd)
+                           }
+                         })
+                       }
+                       app.variables$temp.objects[[ref.name]] <- ref
+                     }
+                   }
+                 }
+               })
+
+  observe( #CHANGE THE POSITIONS
     {
-        file.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_1")
+      body.ui <- NULL
+      if(!is.null(input$t_3_pop_ref_sel))
+      {
+        id <- as.numeric(input$t_3_pop_ref_sel)
+        if(!is.null(id) && !is.na(id) && id <= length(app.variables$ref.objects))
         {
-            file.ui <- lapply(1:length(app.variables$fcs.files), function(i)
+          ref <- app.variables$ref.objects[[id]]
+
+          if(length(ref)>0)
+          {
+            ref.name <- ref$Name
+            if(length(app.variables$temp.objects)==0)
             {
-                tmp.ui <- NULL
-                if(length(app.variables$fcs.files[[i]]) > 0 )
+              app.variables$temp.objects <- list()
+            }
+            if( !ref.name%in%names(app.variables$temp.objects) )
+            {
+              app.variables$temp.objects[[ref.name]] <- ref
+
+              app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+              app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+            }
+            ref <- app.variables$temp.objects[[ref.name]]
+
+            annotation.column <- ref$AnnotationColumn
+            markers <- as.numeric(input$t_3_pop_move_markers_sel)
+            population <- as.numeric(input$t_3_pop_move_pop_sel)
+            if(!is.null(population) && !is.na(population) && population <= length(ref$FCSG2$Positions))
+            {
+              body.ui <- lapply(markers, function(i)
+              {
+                old.pos.m <- ref$FCSG2$Positions[[population]][[1]][[i]]
+                old.pos.sd <- ref$FCSG2$Positions[[population]][[2]][[i]]
+
+                pos.m <- as.numeric(input[[paste0("move_",i,"_plot_m")]])
+                pos.sd <- as.numeric(input[[paste0("move_",i,"_plot_sd")]])
+                if( length(pos.m)>0 && length(pos.sd)>0 )
                 {
-                    file.type <- app.variables$fcs.files[[i]][["type"]]
-                    file.type <- ifelse(file.type=="MUT", 2, 1)
-                    #==
-                    pop.col <- app.variables$fcs.files[[i]][["populations_column"]]
-                    pop.col <- app.variables$fcs.files[[i]][["markers"]][[pop.col]]
-                    if(length(input[[paste0("t_1_pop_sel_",i)]])>0 && input[[paste0("t_1_pop_sel_",i)]]!="" &&
-                       input[[paste0("t_1_pop_sel_",i)]]%in%app.variables$fcs.files[[i]][["markers"]])
-                    {
-                        pop.col <- input[[paste0("t_1_pop_sel_",i)]]
-                    }
-                    #==
-                    visualized.markers <- app.variables$fcs.files[[i]][["markers"]]
-                    if(!is.na(input[[paste0("t_1_viewed_markers_",i)]]) && length(input[[paste0("t_1_viewed_markers_",i)]])>0)
-                    {
-                        visualized.markers <-
-                            as.list(unlist(input[[paste0("t_1_viewed_markers_",i)]])[which(input[[paste0("t_1_viewed_markers_",i)]]%in%
-                                                                                               app.variables$fcs.files[[i]][["markers"]])])
-                    }
-                    visualized.markers <- as.list(unlist(visualized.markers)[which(visualized.markers!=pop.col)])
-                    #==
-                    tmp.ui <- tagList(
-                        box(
-                            width = 8, collapsible=T, style="min-height:15vh",
-                            title = app.variables$fcs.files[[i]][["name"]],
-                            style="padding-left:5%",
-                            plotlyOutput(paste0("t_1_file_",i), width = "100%")
-                        ),
-                        box(
-                            width = 2, style="height:auto",
-                            selectInput(paste0("t_1_pop_sel_",i), "Populations Column",
-                                        choices=app.variables$fcs.files[[i]][["markers"]],
-                                        selected = pop.col),
-                            selectInput(paste0("t_1_cm_sel_",i), "Control/Mutant",
-                                        choices=list("Control"=1,"Mutant"=2),
-                                        selected = file.type),
-                            selectInput(paste0("t_1_viewed_markers_",i), "Visualized Markers",
-                                        choices=app.variables$fcs.files[[i]][["markers"]],
-                                        selected=visualized.markers, multiple = T),
-                            actionButton(paste0("t_1_file_remove_",i), "Remove File", width="60%", style="margin-left:20%")
-                        ),
-                        box(
-                            width = 2, style="auto",
-                            # textInput(paste0("t_1_set_cr_",i), "New Cohort", width="90%"),
-                            # actionButton(paste0("t_1_set_add_",i), "Create", width="90%"),
-                            selectInput(paste0("t_1_set_sel_",i), "Change Cohort",
-                                        choices=app.variables$sets.list,
-                                        selected = app.variables$fcs.files[[i]][["set"]])
-                        )
+                  if( !(pos.m==old.pos.m) || !(pos.sd==old.pos.sd) )
+                  {
+                    shinyjs::disable(paste0("move_",i,"_plot_m"))
+                    shinyjs::disable(paste0("move_",i,"_plot_sd"))
+
+                    ref$FCSG2 <<- move.population(ref$FCSG2, population, i, c(pos.m, pos.sd), -0.5, 4.5, markers)
+                    ref$OriginExpr[[population]] <<- ref$FCSG2$Expr[[population]]
+
+                    delay(10, shinyjs::enable(paste0("move_",i,"_plot_m")))
+                    delay(10, shinyjs::enable(paste0("move_",i,"_plot_sd")))
+                  }
+                }
+              })
+            }
+            app.variables$temp.objects[[ref.name]] <- ref
+          }
+        }
+      }
+
+      return(body.ui)
+    })
+
+  observe( #UPDATE THE MFI PLOTS
+    {
+      markers.ui <- NULL
+
+      if(!is.null(input$t_3_pop_ref_sel))
+      {
+        id <- as.numeric(input$t_3_pop_ref_sel)
+        if(!is.na(id) && id<=length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+
+          markers <- as.numeric(input$t_3_pop_move_markers_sel)
+          population <- as.numeric(input$t_3_pop_move_pop_sel)
+
+          if(length(ref)>0 && population%in%(1:length(ref$FCSG2$Expr)))
+          {
+            ref.name <- ref$Name
+            if(length(app.variables$temp.objects)==0)
+            {
+              app.variables$temp.objects <- list()
+            }
+            if( !ref.name%in%names(app.variables$temp.objects) )
+            {
+              app.variables$temp.objects[[ref.name]] <- ref
+
+              app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+              app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+            }
+            ref <- app.variables$temp.objects[[ref.name]]
+            annotation.column <- ref$AnnotationColumn
+            lapply(markers, function(i)
+            {
+              output[[paste0("move_",i,"_plot")]] <- renderPlot(
+                {
+                  tmp.plot <- NULL
+                  x <- ref$FCSG2
+
+                  mat <- NULL
+                  pop.type <-NULL
+                  for(j in 1:length(x$Expr))
+                  {
+                    mat <- c(mat, x$Expr[[j]][,i])
+                  }
+                  mat.pop <- x$Expr[[population]][,i]
+
+                  df <- data.frame("val"=c(mat.pop, mat),
+                                   "Population"=as.factor(c(rep(paste("Pop",population), length(mat.pop)), rep("All", length(mat)))))
+                  colnames(df)[1] <- colnames(x$Expr[[1]])[i]
+
+                  tmp.plot <- ggplot(df, aes(df[,1], fill=Population, colour=Population)) +
+                    geom_histogram(bins = 100, position="identity", alpha=0.5) + theme(legend.position="top") +
+                    xlab(colnames(x$Expr[[1]])[i])
+
+                  return(tmp.plot)
+
+                })
+            })
+          }
+        }
+      }
+
+    })
+
+
+
+
+  #UPDATE THE NEW SIZE OF THE POPULATIONS
+  observe(
+    {
+      if(!is.null(input$t_3_pop_ref_sel))
+      {
+        id <- as.numeric(input$t_3_pop_ref_sel)
+        if(!is.null(id) && !is.na(id) && id <= length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+
+          if(length(ref)>0)
+          {
+            ref.name <- ref$Name
+            annotation.column <- ref$AnnotationColumn
+            markers <- ref$Markers
+            population <- as.numeric(input$t_3_pop_size_pop_sel)
+
+            if(length(app.variables$temp.objects)==0)
+            {
+              app.variables$temp.objects <- list()
+            }
+            if(is.null(app.variables$temp.objects[[ref.name]]))
+            {
+              app.variables$temp.objects[[ref.name]] <- ref
+
+              app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+              app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+            }
+            ref <- app.variables$temp.objects[[ref.name]]
+
+            new.freq <- as.numeric(input$t_3_pop_size_text)
+            if(!is.null(population) && !is.na(population) && population <= length(ref$FCSG2$Expr) && population <= length(ref$TempFrequencies))
+            {
+              if(!is.null(new.freq) && !is.na(new.freq))
+              {
+                old.freq <- ref$TempFrequencies[[population]]
+                if(abs(new.freq - old.freq))
+                {
+                  shinyjs::disable("t_3_pop_size_slider")
+                  shinyjs::disable("t_3_pop_size_text")
+                  shinyjs::disable("t_3_pop_size_pop_sel")
+
+                  x <- ref$FCSG2
+                  x$Expr[[population]] <- ref$OriginExpr[[population]]
+                  x <- change.population.size(ref.object = x, pop.id = population, new.size = new.freq,
+                                              min.val = -0.5, max.val = 4.5,
+                                              annotation.column = annotation.column, marker.columns = markers)
+                  ref$FCSG2 <- x
+                  ref$TempFrequencies[[population]] <- new.freq
+                  app.variables$temp.objects[[ref.name]] <- ref
+
+                  delay(10, shinyjs::enable("t_3_pop_size_slider"))
+                  delay(10, shinyjs::enable("t_3_pop_size_text"))
+                  delay(10, shinyjs::enable("t_3_pop_size_pop_sel"))
+                }
+              }
+            }
+          }
+        }
+
+      }
+    })
+
+
+
+
+  #2 MARKERS VISUALIZATION
+  output$t_3_pop_plot <- renderPlot(
+    {
+      markers.plot <- NULL
+      if(!is.null(input$t_3_pop_ref_sel))
+      {
+        m1 <- as.integer(input[["t_3_pop_m1"]])
+        m2 <- as.integer(input[["t_3_pop_m2"]])
+
+        id <- as.numeric(input$t_3_pop_ref_sel)
+        if(!is.null(id) && !is.na(id) && id <= length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          if(length(ref)>0 && !is.null(m1) && !is.null(m2))
+          {
+            ref.name <- ref$Name
+
+            annotation.column <- ref$AnnotationColumn
+            highlighted.population <- as.numeric(input$t_3_pop_hp)
+
+            if(length(app.variables$temp.objects)==0)
+            {
+              app.variables$temp.objects <- list()
+            }
+            if( !ref.name%in%names(app.variables$temp.objects) )
+            {
+              app.variables$temp.objects[[ref.name]] <- ref
+
+              app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+              app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+            }
+            ref <- app.variables$temp.objects[[ref.name]]
+
+            if(input$t_3_pop_tab == "C")
+            {
+              population <- as.integer(input$t_3_pop_size_pop_sel)
+              if(!is.null(population) && !is.na(population))
+              {
+                output$t_3_pop_size_nmb_events <- renderUI(
+                  {
+                    events.ui <- NULL
+                    events.ui <- h5(nrow(ref$FCSG2$Expr[[population]]))
+
+                    return(events.ui)
+                  })
+              }
+            }
+
+            if( !(m1==m2) )
+            {
+              x <- ref$FCSG2
+
+              mat <- NULL
+              pop.type <- NULL
+              for(i in 1:length(x$Expr))
+              {
+                if(i%in%highlighted.population)
+                {
+                  pop.type <- c(pop.type, rep("Highlighted", nrow(x$Expr[[i]])))
+                }
+                else
+                {
+                  pop.type <- c(pop.type, rep("Others", nrow(x$Expr[[i]])))
+                }
+                mat <- rbind(mat, x$Expr[[i]])
+              }
+
+              df <- as.data.frame(mat)[,c(m1,m2)]
+              colnames(df) <- colnames(x$Expr[[1]])[c(m1,m2)]
+              df$Population <- as.factor(pop.type)
+              pop.colors <- c(Highlighted="green", Others="black")
+
+              markers.plot <- ggplot(df, aes(df[,1], df[,2], colour=Population)) +
+                geom_point(size=0.8) + scale_colour_manual(values=pop.colors) + xlim(c(-0.5,4.5)) + ylim(c(-0.5,4.5)) +
+                xlab(colnames(df)[1]) + ylab(colnames(df)[2])
+            }
+          }
+        }
+      }
+
+      return(markers.plot)
+    })
+
+
+
+  #UPDATE NUMERIC INPUT / SLIDER WHEN CHANGING POP AND WHEN CHANGING ONE OF THEM
+  observeEvent(input$t_3_pop_size_slider,
+               {
+                 old.value <- NULL
+                 if(!is.null(input$t_3_pop_size_slider))
+                 {
+                   if(!is.null(input$t_3_pop_size_text))
+                   {
+                     old.value <- as.numeric(input$t_3_pop_size_text)
+                   }
+
+                   new.value <- as.numeric(input$t_3_pop_size_slider)
+                   if( abs(new.value - old.value)>0.000001 )
+                   {
+                     updateNumericInput(session, "t_3_pop_size_text", value = new.value)
+                   }
+                 }
+               })
+
+  observeEvent(input$t_3_pop_size_text,
+               {
+                 old.value <- NULL
+                 if(!is.null(input$t_3_pop_size_text))
+                 {
+                   if(!is.null(input$t_3_pop_size_slider))
+                   {
+                     old.value <- as.numeric(input$t_3_pop_size_slider)
+                   }
+
+                   new.value <- as.numeric(input$t_3_pop_size_text)
+                   if( abs(new.value - old.value)>0.000001 )
+                   {
+                     updateSliderInput(session, "t_3_pop_size_slider", value = new.value)
+                   }
+                 }
+               })
+
+  observeEvent(input$t_3_pop_size_pop_sel,
+               {
+                 new.value <- 100
+                 if(!is.null(input$t_3_pop_ref_sel) && length(app.variables$ref.objects)>0)
+                 {
+                   id <- as.numeric(input$t_3_pop_ref_sel)
+                   if(!is.na(id) && id <= length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[id]]
+                     if(length(ref)>0)
+                     {
+                       ref.name <- ref$Name
+                       if(length(app.variables$temp.objects)==0)
+                       {
+                         app.variables$temp.objects <- list()
+                       }
+                       if(is.null(app.variables$temp.objects[[ref.name]]))
+                       {
+                         app.variables$temp.objects[[ref.name]] <- ref
+
+                         app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                           lapply(ref$FCSG2$Expr, function(mat){return(mat)})
+
+                         app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+                       }
+                       ref <- app.variables$temp.objects[[ref.name]]
+
+                       pop <- as.numeric(input$t_3_pop_size_pop_sel)
+                       if(length(ref$TempFrequencies)>0 && pop <= length(ref$TempFrequencies))
+                       {
+                         new.value <- ref$TempFrequencies[[pop]]
+                       }
+                     }
+                   }
+                 }
+                 updateNumericInput(session,"t_3_pop_size_text", value=new.value)
+                 updateSliderInput(session,"t_3_pop_size_slider", value=new.value)
+               })
+
+  observeEvent(input$t_3_pop_manage_rm, #DELETE POP
+               {
+                 if(!is.null(input$t_3_pop_ref_sel) && !is.null(input$t_3_pop_ref_sel))
+                 {
+                   id <- as.numeric(input$t_3_pop_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+                   ref.name <- ref$Name
+                   if(length(app.variables$temp.objects)>0 && !is.null(app.variables$temp.objects[[ref.name]]))
+                   {
+                     ref <- app.variables$temp.objects[[ref.name]]
+                   }
+
+                   if(length(ref)>0)
+                   {
+                     pop <- as.integer(input$t_3_pop_manage_rm_sel)
+
+                     tmp.obj <- delete.population(ref$FCSG2, pop)
+
+                     if(length(app.variables$temp.objects)==0)
+                     {
+                       app.variables$temp.objects <- list()
+                     }
+                     if(is.null(app.variables$temp.objects[[ref.name]]))
+                     {
+                       app.variables$temp.objects[[ref.name]] <- app.variables$ref.objects[[id]]
+
+                       app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                         lapply(app.variables$ref.objects[[id]]$FCSG2$Expr, function(mat){return(mat)})
+
+                       app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+                     }
+
+                     app.variables$temp.objects[[ref.name]]$FCSG2 <- tmp.obj
+                     app.variables$temp.objects[[ref.name]]$OriginExpr <- app.variables$temp.objects[[ref.name]]$OriginExpr[-pop]
+                     app.variables$temp.objects[[ref.name]]$TempFrequencies <- app.variables$temp.objects[[ref.name]]$TempFrequencies[-pop]
+                   }
+                 }
+               })
+
+  observeEvent(input$t_3_pop_manage_add, #ADD POP
+               {
+                 if(!is.null(input$t_3_pop_ref_sel) && !is.null(input$t_3_pop_manage_add_sel))
+                 {
+                   id <- as.numeric(input$t_3_pop_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+                   ref.name <- ref$Name
+                   if(length(app.variables$temp.objects)>0 && !is.null(app.variables$temp.objects[[ref.name]]))
+                   {
+                     ref <- app.variables$temp.objects[[ref.name]]
+                   }
+
+                   if(length(ref)>0)
+                   {
+                     annotation.column <- ref$AnnotationColumn
+                     markers <- ref$Markers
+
+                     ref.population <- as.numeric(input$t_3_pop_manage_add_sel)
+                     nmb.events <- as.numeric(input$t_3_pop_manage_add_events)
+
+                     tmp.obj <- add.population(ref.object = ref$FCSG2, nmb.events = nmb.events,
+                                               annotation.column = annotation.column,
+                                               marker.columns = markers,
+                                               ref.pop = ref.population,
+                                               min.val = -0.5, max.val = 4.5)
+
+
+                     if(length(app.variables$temp.objects)==0)
+                     {
+                       app.variables$temp.objects <- list()
+                     }
+                     if(is.null(app.variables$temp.objects[[ref.name]]))
+                     {
+                       app.variables$temp.objects[[ref.name]] <- app.variables$ref.objects[[id]]
+
+                       app.variables$temp.objects[[ref.name]]$OriginExpr <-
+                         lapply(app.variables$ref.objects[[id]]$FCSG2$Expr, function(mat){return(mat)})
+
+                       app.variables$temp.objects[[ref.name]]$TempFrequencies <- rep(100, length(ref$FCSG2$Frequencies))
+                     }
+                     app.variables$temp.objects[[ref.name]]$FCSG2 <- tmp.obj
+
+                     if(is.null(app.variables$temp.objects[[ref.name]]))
+                     {
+                       app.variables$temp.objects[[ref.name]] <- app.variables$ref.objects[[id]]
+                     }
+
+                     app.variables$temp.objects[[ref.name]]$FCSG2 <- tmp.obj
+                     app.variables$temp.objects[[ref.name]]$OriginExpr[[length(app.variables$temp.objects[[ref.name]]$OriginExpr)+1]] <-
+                       tmp.obj$Expr[[ref.population]]
+                     app.variables$temp.objects[[ref.name]]$TempFrequencies[[length(app.variables$temp.objects[[ref.name]]$TempFreqiencies)+1]] <- 100
+                   }
+                 }
+               })
+
+  #UPDATE POP
+  observe(
+    {
+      update.populations.from.temp("t_3_pop_ref_sel", "t_3_pop_manage_rm_sel")
+      update.populations.from.temp("t_3_pop_ref_sel", "t_3_pop_manage_add_sel")
+      update.populations.from.temp("t_3_pop_ref_sel", "t_3_pop_move_pop_sel")
+      update.populations.from.temp("t_3_pop_ref_sel", "t_3_pop_size_pop_sel")
+      update.populations.from.temp("t_3_pop_ref_sel", "t_3_pop_hp")
+    })
+
+  observeEvent(input$t_3_pop_generate, #GENERATE THE MODEL
+               {
+                 shinyjs::disable("t_3_pop_generate")
+                 if(!is.null(input$t_3_pop_ref_sel))
+                 {
+                   id <- as.numeric(input$t_3_pop_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+                   if(length(ref)>0)
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Validating modifications", value = 0)
+                     ref.name <- ref$Name
+                     if(length(ref)>0 && length(app.variables$temp.objects)>0 && ref.name%in%names(app.variables$temp.objects))
+                     {
+                       ref <- app.variables$temp.objects[[ref.name]]
+                       annotation.column <- ref$AnnotationColumn
+
+                       tmp.id <- which(names(app.variables$temp.objects)==ref.name)
+                       if(length(tmp.id)>0)
+                       {
+                         tmp.name <- paste0(input$t_3_pop_model_name, "_", ref.name)
+                         ref$Name <- tmp.name
+                         ref$GroupSize <- 1
+                         app.variables$ref.objects[[length(app.variables$ref.objects)+1]] <- ref
+                         app.variables$temp.objects <- app.variables$temp.objects[-unlist(tmp.id)]
+                       }
+                     }
+                     progress$set(message = "Model Generated", value = 1)
+                     delay(500, progress$close())
+                   }
+                 }
+                 delay(200, shinyjs::enable("t_3_pop_generate"))
+               })
+  #===================================================================
+
+
+
+
+
+
+
+  #3.2 - Generate Model (PSEUDO-TIMELINE)
+  #===================================================================
+  observeEvent(input$t_3_tp_remove, #Remove button
+               {
+                 shinyjs::disable("t_3_tp_remove")
+
+                 if( !is.null(input$t_3_tp_ref_sel) && !is.null(input$t_3_tp_remove_sel))
+                 {
+                   id <- as.numeric(input$t_3_tp_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+                   if(length(ref)>0)
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Removing Files", value = 0)
+                     ref.name <- ref$Name
+                     obj.ids <- as.integer(input$t_3_tp_remove_sel)
+
+                     app.variables$TP.objects[[ref.name]] <- app.variables$TP.objects[[ref.name]][-obj.ids]
+                     app.variables$TP.list[[ref.name]] <- app.variables$TP.list[[ref.name]][-obj.ids]
+                     progress$set(message = "Files Removed", value = 1)
+                     delay(500, progress$close())
+                   }
+                 }
+
+                 delay(500, shinyjs::enable("t_3_tp_remove"))
+               })
+
+  observe(
+    {
+      obj.list.ids <- list()
+      if( !is.null(input$t_3_tp_ref_sel) )
+      {
+        id <- as.numeric(input$t_3_tp_ref_sel)
+        if(!is.na(id) && id<=length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          ref.name <- ref$Name
+
+          if(length(ref)>0)
+          {
+            if(length(app.variables$TP.objects[[ref.name]])>0)
+            {
+              obj.list.ids <- 1:length(app.variables$TP.objects[[ref.name]])
+              TP.obj.names <- NULL
+              if(length(app.variables$TP.objects[[ref.name]])>0)
+              {
+                TP.obj.names <- sapply(1:length(app.variables$TP.objects[[ref.name]]), function(i)
+                {
+                  return(app.variables$TP.objects[[ref.name]][[i]]$Name)
+                })
+              }
+              names(obj.list.ids) <- TP.obj.names
+            }
+          }
+        }
+      }
+      updateSelectInput(session, "t_3_tp_remove_sel", choices=obj.list.ids, selected = obj.list.ids)
+    })
+
+  observeEvent(input$t_3_tp_add,
+               {
+                 shinyjs::disable("t_3_tp_add")
+                 if(!is.null(input$t_3_tp_ref_sel))
+                 {
+                   id <- as.numeric(input$t_3_tp_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+                   if(length(ref)>0)
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Adding Time Point", value = 0)
+                     ref.name <- ref$Name
+
+                     markers <- ref$Markers
+                     annotation.column <- ref$AnnotationColumn
+                     comp <- ref$Compensated
+                     transf <- ref$Transformed
+                     nmb.pop <- length(ref$FCSG2$Expr)
+
+                     pop.reduction.percentages <- rep(0, nmb.pop)
+                     locked.populations = NULL
+
+                     tmp.name <- paste0(ref$Name, "_TP_",length(app.variables$TP.list[[ref.name]]))
+
+
+                     if(length(app.variables$TP.list)==0)
+                     {
+                       app.variables$TP.list <- list()
+                     }
+
+                     if(length(app.variables$TP.list[[ref.name]])==0)
+                     {
+                       app.variables$TP.list[[ref.name]] <- list()
+                       app.variables$TP.list[[ref.name]][[1]] <- list("Populations" = 1:nmb.pop,
+                                                                      "LockedPopulations" = locked.populations,
+                                                                      "ReductionValues" = pop.reduction.percentages)
+                     }
+                     else
+                     {
+                       last.tp <- app.variables$TP.list[[ref.name]][[length(app.variables$TP.list[[ref.name]])]]
+                       app.variables$TP.list[[ref.name]][[length(app.variables$TP.list[[ref.name]])+1]] <- last.tp
+                       pop.reduction.percentages <- last.tp$ReductionValues
+                       locked.populations <- last.tp$LockedPopulations
+                       ref <- app.variables$TP.objects[[ref.name]][[length(app.variables$TP.objects[[ref.name]])]]
+                     }
+
+                     x <- generate.FCSG2.file.by.reducing.populations.in.ref(ref.object = ref$FCSG2,
+                                                                             pop.reduction.percentages = pop.reduction.percentages,
+                                                                             locked.populations = locked.populations,
+                                                                             marker.columns = markers,
+                                                                             annotation.column = annotation.column,
+                                                                             min.val = -0.5, max.val = 4.5)
+
+                     tmp.obj <- list("FCSG2"=x,
+                                     "Transformed"=transf,
+                                     "Compensated"=comp,
+                                     "Name"=tmp.name,
+                                     "AnnotationColumn"=annotation.column,
+                                     "Markers"=markers )
+
+
+                     if(length(app.variables$TP.objects)==0)
+                     {
+                       app.variables$TP.objects <- list()
+                     }
+                     if(length(app.variables$TP.objects[[ref.name]])==0)
+                     {
+                       app.variables$TP.objects[[ref.name]] <- list()
+                     }
+                     app.variables$TP.objects[[ref.name]][[length(app.variables$TP.objects[[ref.name]])+1]] <- tmp.obj
+                     progress$set(message = "Time Point added (an update might be required)", value = 1)
+                     delay(500, progress$close())
+                   }
+                 }
+                 delay(300, shinyjs::enable("t_3_tp_add"))
+               })
+
+  observeEvent(input$t_3_tp_update,
+               {
+                 shinyjs::disable("t_3_tp_update")
+                 if(!is.null(input$t_3_tp_ref_sel))
+                 {
+                   id <- as.numeric(input$t_3_tp_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+                   if(length(ref)>0)
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Updating the Pseudo-Time", value = 0)
+                     ref.name <- ref$Name
+                     markers <- ref$Markers
+                     annotation.column <- ref$AnnotationColumn
+                     comp <- ref$Compensated
+                     transf <- ref$Transformed
+
+                     if(length(app.variables$TP.list[[ref.name]])>0)
+                     {
+                       for(i in 1:length(app.variables$TP.list[[ref.name]]))
+                       {
+                         tp <- app.variables$TP.list[[ref.name]][[i]]
+                         if(i>1)
+                         {
+                           ref <- app.variables$TP.objects[[ref.name]][[i-1]]
+                         }
+
+                         red.pop <- sapply(1:length(tp$Populations), function(j)
+                         {
+                           return( as.numeric(input[[paste0("tp_", i, "_red_pop_", j)]]) )
+                         })
+
+                         locked.pop <- which(sapply(1:length(tp$Populations), function(j)
+                         {
+                           return( as.logical(input[[paste0("tp_", i, "_cb_pop_", j)]]) )
+                         }))
+                         if(length(locked.pop)==0)
+                         {
+                           locked.pop <- NULL
+                         }
+
+                         tmp.name <- app.variables$TP.objects[[ref.name]][[i]]$Name
+                         x <- generate.FCSG2.file.by.reducing.populations.in.ref(ref.object = ref$FCSG2,
+                                                                                 pop.reduction.percentages = red.pop,
+                                                                                 locked.populations = locked.pop,
+                                                                                 marker.columns = markers,
+                                                                                 annotation.column = annotation.column,
+                                                                                 min.val = -0.5, max.val = 4.5)
+
+                         tmp.obj <- list("FCSG2"=x,
+                                         "Transformed"=transf,
+                                         "Compensated"=comp,
+                                         "Name"=tmp.name,
+                                         "AnnotationColumn"=annotation.column,
+                                         "Markers"=markers )
+
+                         app.variables$TP.list[[ref.name]][[i]]$LockedPopulations <- locked.pop
+                         app.variables$TP.list[[ref.name]][[i]]$ReductionValues <- red.pop
+                         app.variables$TP.objects[[ref.name]][[i]] <- tmp.obj
+
+                       }
+                     }
+                     progress$set(message = "Pseudo-time updated", value = 1)
+                     delay(500, progress$close())
+                   }
+                 }
+                 delay(300, shinyjs::enable("t_3_tp_update"))
+               })
+
+  observeEvent(input$t_3_tp_generate, #Validate
+               {
+                 shinyjs::disable("t_3_tp_generate")
+                 if( !is.null(input$t_3_tp_ref_sel) )
+                 {
+                   id <- as.numeric(input$t_3_tp_ref_sel)
+                   if(!is.na(id) && id<=length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[id]]
+
+                     if(length(ref)>0)
+                     {
+                       ref.name <- ref$Name
+                       if(length(app.variables$TP.objects)>0 && length(app.variables$TP.objects[[ref.name]])>0)
+                       {
+                         tp.ids <- 1:length(app.variables$TP.objects[[ref.name]])
+                         nmb.files <- length(tp.ids)
+
+                         if(length(tp.ids)>0 && !is.null(tp.ids))
+                         {
+                           progress <- Progress$new()
+                           progress$set(message = "Generating the Models", value = 0)
+                           for(i in tp.ids)
+                           {
+                             if(length(app.variables$ref.objects)==0)
+                             {
+                               app.variables$ref.objects <- list()
+                             }
+                             app.variables$ref.objects[[length(app.variables$ref.objects)+1]] <- app.variables$TP.objects[[ref.name]][[i]]
+                             app.variables$ref.objects[[length(app.variables$ref.objects)]]$GroupSize <- 1
+                             progress$inc(1/nmb.files, detail = paste(app.variables$TP.objects[[ref.name]][[i]]$Name, "Generated"))
+                           }
+                           app.variables$TP.objects[[ref.name]] <- app.variables$shift.objects[[ref.name]][-tp.ids]
+                           app.variables$TP.list[[ref.name]] <- app.variables$TP.list[[ref.name]][-tp.ids]
+                         }
+                         progress$set(message = "Models Generated", value = 1)
+                         delay(500, progress$close())
+                       }
+                     }
+                   }
+                 }
+                 delay(200, shinyjs::enable("t_3_tp_generate"))
+               })
+
+  output$t_3_tp_body <- renderUI( #PLOT TIME POINTS
+    {
+      tp.ui <- NULL
+
+      if(!is.null(input$t_3_tp_ref_sel))
+      {
+        id <- as.numeric(input$t_3_tp_ref_sel)
+        ref <- app.variables$ref.objects[[id]]
+        ref.name <- ref$Name
+        markers <- ref$Markers
+        annotation.column <- ref$AnnotationColumn
+        comp <- ref$Compensated
+        transf <- ref$Transformed
+
+        if(length(ref)>0)
+        {
+          if(length(app.variables$TP.list[[ref.name]])>0)
+          {
+            tp.ui <- lapply(1:length(app.variables$TP.list[[ref.name]]), function(i)
+            {
+              tp <- app.variables$TP.list[[ref.name]][[i]]
+
+              red.pop.ui <- lapply(1:length(tp$Populations), function(j)
+              {
+                tmp.ui <- tagList(
+                  column(
+                    width=12,
+                    numericInput(paste0("tp_", i, "_red_pop_", j), tp$Populations[[j]], value=tp$ReductionValues[[j]])
+                  )
+                )
+
+                return(tmp.ui)
+              })
+
+              locked.pop.ui <- lapply(1:length(tp$Populations), function(j)
+              {
+                l <- F
+                if(j%in%unlist(tp$LockedPopulations))
+                {
+                  l <- T
+                }
+                tmp.ui <- tagList(
+                  column(
+                    width=12,
+                    checkboxInput(paste0("tp_", i, "_cb_pop_", j), tp$Populations[[j]], value=l)
+                  )
+                )
+
+                return(tmp.ui)
+              })
+
+              collapsed <- T
+              if(i==length(app.variables$TP.list[[ref.name]]))
+              {
+                collapsed <- F
+              }
+
+              tmp.ui <- tagList(
+                shinydashboard::box(
+                  width=12, solidHeader=T, status="info", collapsible = T, collapsed = collapsed,
+                  title=paste("Pseudo-Time - Time Point", i),
+
+                  column(
+                    width=4,
+                    shinydashboard::box(
+                      width=12,title="Reduction %", style="overflow:auto;max-height:17vh",
+                      solidHeader=T,status="info",
+                      red.pop.ui
+                    ),
+                    shinydashboard::box(
+                      width=12,title="Locked Populations", style="overflow:auto;max-height:17vh",
+                      solidHeader=T,status="info",
+                      locked.pop.ui
                     )
+                  ),
+                  column(
+                    width=8,
+                    plotOutput(paste0("tp_",i,"_plot"))
+                  )
+                )
+              )
 
-                    # observeEvent(input[[paste0("t_1_set_add_",i)]],
-                    # {
-                    #      if(length(input[[paste0("t_1_set_cr_",i)]])>0)
-                    #      {
-                    #          tmp.set <- input[[paste0("t_1_set_cr_",i)]]
-                    #
-                    #          if(!(tmp.set %in% unlist(app.variables$sets.list)))
-                    #          {
-                    #              app.variables$sets.list[[length(app.variables$sets.list)+1]] <<- input[[paste0("t_1_set_cr_",i)]]
-                    #              app.variables$fcs.files[[i]][["set"]] <<- input[[paste0("t_1_set_cr_",i)]]
-                    #              maj.sets.list()
-                    #          }
-                    #      }
-                    #  }, once = T)
-
-                    observeEvent(input[[paste0("t_1_file_remove_",i)]],
-                    {
-                        update.log(paste(app.variables$fcs.files[[i]][["name"]], "removed"))
-                        update.log("")
-                        app.variables$fcs.files[[i]] <<- list()
-                        app.variables$output.matrices[[i]] <<- list()
-                        app.variables$populations.list[[i]] <<- list()
-                        app.variables$reduction.percentages[[i]] <<- list()
-                        removeUI(paste0("#t_1_file_",i,"_ui"))
-                    }, once = T)
-
-                    return(tmp.ui)
-                }
-            })
-        }
-        return(file.ui)
-    })
-
-    observe( #MAJ DES HEATMAPS DES POPS & LISTE MEAN/SD PAR POP
-    {
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_1")
-        {
-            lapply(1:length(app.variables$fcs.files), function(i)
-            {
-                if(length(app.variables$fcs.files[[i]]) > 0 && !is.na(input[[paste0("t_1_viewed_markers_",i)]]) &&
-                   length(input[[paste0("t_1_viewed_markers_",i)]])>0)
+              output[[paste0("tp_",i,"_plot")]] <- renderPlot(
                 {
-                    pop.ids <- app.variables$populations.list[[i]]
-                    exp.mat <- app.variables$output.matrices[[i]]
-                    col.id <- app.variables$fcs.files[[i]][["populations_column"]]
-                    viewed.markers <- as.numeric(unlist(which(app.variables$fcs.files[[i]][["markers"]]%in%
-                                                                  input[[paste0("t_1_viewed_markers_",i)]])))
-                    viewed.markers <- viewed.markers[viewed.markers!=col.id]
+                  tmp.plot <- NULL
 
-                    file.plot <- NULL
-                    tmp.val <- create.pop.table.from.fcs.matrix(exp.mat, pop.ids, viewed.markers, col.id)
-                    if(!is.null(tmp.val[[1]]))
+                  if(!is.null(input$t_3_tp_M1) && !is.null(input$t_3_tp_M2)
+                     && length(app.variables$TP.objects[[ref.name]])>0)
+                  {
+                    m1 <- as.integer(input$t_3_tp_M1)
+                    m2 <- as.integer(input$t_3_tp_M2)
+                    if(!m1==m2)
                     {
-                        file.plot <- heatmaply(tmp.val[[2]], Rowv = T, Colv="Rowv", dendrogram = "none")
-                    }
-                    output[[paste0("t_1_file_",i)]] <- renderPlotly(file.plot)
-                }
-            })
-        }
-    })
+                      locked.pop <- tp$LockedPopulations
+                      mod.pop <- which(tp$ReductionValues>0)
+                      free.pop <- (1:length(tp$Populations))[-unique(c(locked.pop,mod.pop))]
 
-    observe( #GESTION DES SETS
-    {
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_1")
-        {
-            lapply(1:length(app.variables$fcs.files), function(i)
-            {
-                if(length(app.variables$fcs.files[[i]])>0)
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && length(input[[paste0("t_1_set_sel_",i)]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]]!=input[[paste0("t_1_set_sel_",i)]])
+                      x <- app.variables$TP.objects[[ref.name]][[i]]$FCSG2
+                      mat <- NULL
+                      pop.type <-NULL
+                      for(i in 1:length(x$Expr))
+                      {
+                        if(i%in%mod.pop)
                         {
-                            update.log(paste0(app.variables$fcs.files[[i]][["name"]], ": cohort changed"))
-                            update.log(paste("======== from", app.variables$fcs.files[[i]][["set"]]))
-                            update.log(paste("======== to", input[[paste0("t_1_set_sel_",i)]]))
-                            update.log("")
-                            #==
-                            app.variables$fcs.files[[i]][["set"]] <<- input[[paste0("t_1_set_sel_",i)]]
-                            app.variables$fcs.files[[i]][["source_ctrl"]] <<- input[[paste0("t_1_set_sel_",i)]]
+                          pop.type <- c(pop.type, rep("Reduced",nrow(x$Expr[[i]])))
                         }
-                    }
-                }
-            })
-        }
-    })
-
-    observe( #UPDATE POP COLUMN
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_1")
-        {
-            lapply(1:length(app.variables$fcs.files), function(f.id)
-            {
-                if(length(app.variables$fcs.files[[f.id]])>0)
-                {
-                    if(length(input[[paste0("t_1_pop_sel_",f.id)]])>0 && input[[paste0("t_1_pop_sel_",f.id)]] != "" && !is.na(input[[paste0("t_1_pop_sel_",f.id)]]))
-                    {
-                        pop.col <- as.numeric(which(app.variables$fcs.files[[f.id]][["markers"]]==input[[paste0("t_1_pop_sel_",f.id)]])[[1]])
-                        #==
-                        if(!is.na(pop.col) && as.numeric(pop.col)>0 && pop.col != app.variables$fcs.files[[f.id]][["populations_column"]])
+                        else if(i%in%free.pop)
                         {
-                            pop.list <- as.numeric(unique(app.variables$output.matrices[[f.id]][,pop.col]))
-                            if(length(pop.list)<=100)
-                            {
-                                app.variables$fcs.files[[f.id]][["populations_column"]] <<- pop.col
-                                pop.events.ids <- lapply(1:length(pop.list), function(i)
-                                {
-                                    return(unlist(which(app.variables$output.matrices[[f.id]][,pop.col]==pop.list[[i]])))
-                                })
-                                names(pop.events.ids) <- 1:length(pop.list)
-                                app.variables$populations.list[[f.id]] <<- pop.events.ids
-                            }
+                          pop.type <- c(pop.type, rep("Free",nrow(x$Expr[[i]])))
                         }
+                        else
+                        {
+                          pop.type <- c(pop.type, rep("Locked",nrow(x$Expr[[i]])))
+                        }
+                        mat <- rbind(mat,
+                                     x$Expr[[i]])
+                      }
+                      df <- as.data.frame(mat[,c(m1,m2)])
+                      df <- cbind(df,
+                                  "Type"=pop.type)
+                      df$Type <- as.factor(df$Type)
+                      tmp.plot <- ggplot(df, aes(df[,1],df[,2])) + geom_point(aes(colour=Type))
                     }
-                }
+                  }
+
+                  return(tmp.plot)
+                })
+
+              return(tmp.ui)
             })
+          }
         }
+      }
+
+      return(tp.ui)
+    })
+  #===================================================================
+
+
+
+
+
+
+  #3.3 - Generate Model (MIX FILES)
+  #===================================================================
+  observe( #MARKERS
+    {
+      markers <- list(NULL=NULL)
+      m1 <- list(NULL=NULL)
+      m2 <- list(NULL=NULL)
+      if(!is.null(input$t_3_mix_r1_sel) && !is.null(input$t_3_mix_r2_sel))
+      {
+        id1 <- as.numeric(input$t_3_mix_r1_sel)
+        ref1 <- NULL
+        ref1.name <- NULL
+        if(!is.na(id1) && id1<=length(app.variables$ref.objects))
+        {
+          ref1 <- app.variables$ref.objects[[id1]]
+          ref1.name <- ref1$Name
+        }
+
+        id2 <- as.numeric(input$t_3_mix_r2_sel)
+        ref2 <- NULL
+        ref2.name <- NULL
+        if(!is.na(id2) && id2<=length(app.variables$ref.objects))
+        {
+          ref2 <- app.variables$ref.objects[[id2]]
+          ref2.name <- ref2$Name
+        }
+
+        if(length(ref1)>0 && length(ref2)>0)
+        {
+          markers.names.r1 <- colnames(ref1$FCSG2$Expr[[1]])[ref1$Markers]
+          markers.names.r2 <- colnames(ref2$FCSG2$Expr[[1]])[ref2$Markers]
+
+          markers <- unique(intersect(markers.names.r1, markers.names.r2))
+          names(markers) <- markers
+          if(length(markers)>0)
+          {
+            m1 <- markers[[1]]
+          }
+          if(length(markers)>1)
+          {
+            m2 <- markers[[2]]
+          }
+        }
+      }
+      updateSelectInput(session, "t_3_mix_m1", choices=markers, selected = m1)
+      updateSelectInput(session, "t_3_mix_m2", choices=markers, selected = m2)
     })
 
-    observe( #UPDATE FILE TYPE
+  observeEvent(input$t_3_mix_generate, #GENERATE THE FILE
+               {
+                 shinyjs::disable("t_3_mix_generate")
+                 if(!is.null(input$t_3_mix_r1_sel) && !is.null(input$t_3_mix_r2_sel) && !is.null(input$t_3_mix_r1_p) && !is.null(input$t_3_mix_r2_p))
+                 {
+                   id.1 <- as.numeric(input$t_3_mix_r1_sel)
+                   ref.1 <- app.variables$ref.objects[[id.1]]
+                   ref.1.name <- ref.1$Name
+                   populations.1 <- as.numeric(input$t_3_mix_r1_pop_sel)
+
+                   id.2 <- as.numeric(input$t_3_mix_r2_sel)
+                   ref.2 <- app.variables$ref.objects[[id.2]]
+                   ref.2.name <- ref.2$Name
+                   populations.2 <- as.numeric(input$t_3_mix_r2_pop_sel)
+
+                   t1 <- as.numeric(input$t_3_mix_r1_p)
+                   t2 <- as.numeric(input$t_3_mix_r2_p)
+
+                   if(length(ref.1)>0 && length(ref.2)>0 && !is.null(t1) && !is.null(t2))
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Merging Reference Files", value = 0)
+                     markers.names.r1 <- colnames(ref.1$FCSG2$Expr[[1]])[ref.1$Markers]
+                     markers.names.r2 <- colnames(ref.2$FCSG2$Expr[[1]])[ref.2$Markers]
+
+                     markers <- unique(intersect(markers.names.r1, markers.names.r2))
+                     markers.ids.1 <- NULL
+                     markers.ids.2 <- NULL
+                     for(i in 1:length(markers))
+                     {
+                       m.id <- which(markers.names.r1==markers[[i]])
+                       if(length(m.id)>0)
+                       {
+                         markers.ids.1 <- c(markers.ids.1, as.integer(m.id[[1]]))
+                       }
+
+                       m.id <- which(markers.names.r2==markers[[i]])
+                       if(length(m.id)>0)
+                       {
+                         markers.ids.2 <- c(markers.ids.2, as.integer(m.id[[1]]))
+                       }
+                     }
+
+                     x1 <- ref.1$FCSG2$Expr
+                     x2 <- ref.2$FCSG2$Expr
+                     x <- mix.files(ref.obj1 = ref.1$FCSG2, ref.obj2 = ref.2$FCSG2, t1, t2,
+                                    annotation.column.1 = ref.1$AnnotationColumn, annotation.column.2 = ref.2$AnnotationColumn,
+                                    markers.1 = markers.ids.1, markers.2 = markers.ids.2)
+
+                     tmp.name <- paste0("MIX_",id.1,"_",id.2,
+                                        "__",ref.1.name,"__",ref.2.name)
+                     if(length(app.variables$mix.objects)==0)
+                     {
+                       app.variables$mix.objects <- list()
+                     }
+                     app.variables$mix.objects <- list.append(app.variables$mix.objects,
+                                                              as.list(list("FCSG2"=x,
+                                                                           "Transformed"=T,
+                                                                           "Compensated"=T,
+                                                                           "Name"=tmp.name,
+                                                                           "AnnotationColumn"=length(markers)+1,
+                                                                           "Markers"=1:length(markers),
+                                                                           "GroupSize"=1)))
+                     names(app.variables$mix.objects)[[length(app.variables$mix.objects)]] <- tmp.name
+                     progress$set(message = "File Generated", value = 1)
+                     delay(500, progress$close())
+                   }
+                 }
+                 delay(300, shinyjs::enable("t_3_mix_generate"))
+               })
+
+  observe( #NEW POPULATIONS
     {
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_1")
+      populations <- list(NULL=NULL)
+      if(!is.null(input$t_3_mix_r1_sel) && !is.null(input$t_3_mix_r2_sel))
+      {
+        id.1 <- as.numeric(input$t_3_mix_r1_sel)
+        ref.1 <- NULL
+        ref.1.name <- NULL
+        if(!is.na(id.1) && id.1<=length(app.variables$ref.objects))
         {
-            lapply(1:length(app.variables$fcs.files), function(i)
+          ref.1 <- app.variables$ref.objects[[id.1]]
+          ref.1.name <- ref.1$Name
+        }
+
+        id.2 <- as.numeric(input$t_3_mix_r2_sel)
+        ref.2 <- NULL
+        ref.2.name <- NULL
+        if(!is.na(id.2) && id.2<=length(app.variables$ref.objects))
+        {
+          ref.2 <- app.variables$ref.objects[[id.2]]
+          ref.2.name <- ref.2$Name
+        }
+
+        if(length(ref.1)>0 && length(ref.2)>0)
+        {
+
+          tmp.name <- paste0("MIX_",id.1,"_",id.2,
+                             "__",ref.1.name,"__",ref.2.name)
+
+          if(length(app.variables$mix.objects)>0 && !is.null(app.variables$mix.objects[[tmp.name]]))
+          {
+            ref <- app.variables$mix.objects[[tmp.name]]
+            populations <- 1:length(ref$FCSG2$Expr)
+          }
+        }
+      }
+      updateSelectInput(session, "t_3_mix_hp", choices=populations, selected = populations)
+    })
+
+  output$t_3_mix_plot <- renderPlot( #VISUALIZATION
+    {
+      viz.plot <- NULL
+
+      m1 <- input[["t_3_mix_m1"]]
+      m2 <- input[["t_3_mix_m2"]]
+      if(!is.null(input$t_3_mix_r1_sel) && !is.null(input$t_3_mix_r2_sel) && !is.null(m1) && !is.null(m2))
+      {
+        id.1 <- as.numeric(input$t_3_mix_r1_sel)
+        ref.1 <- app.variables$ref.objects[[id.1]]
+        ref.1.name <- ref.1$Name
+        populations.1 <- as.numeric(input$t_3_mix_r1_pop_sel)
+
+        id.2 <- as.numeric(input$t_3_mix_r2_sel)
+        ref.2 <- app.variables$ref.objects[[id.2]]
+        ref.2.name <- ref.2$Name
+        populations.2 <- as.numeric(input$t_3_mix_r2_pop_sel)
+
+        tmp.name <- paste0("MIX_",id.1,"_",id.2,
+                           "__",ref.1.name,"__",ref.2.name)
+
+        if(length(app.variables$mix.objects)>0 && !is.null(app.variables$mix.objects[[tmp.name]]))
+        {
+          ref <- app.variables$mix.objects[[tmp.name]]
+          markers <- ref$Markers
+          highlighted.population <- as.numeric(input$t_3_mix_hp)
+
+          if(length(ref)>0)
+          {
+            x <- ref$FCSG2
+            mat <- NULL
+            pop.type <-NULL
+            for(i in 1:length(x$Expr))
             {
-                if(length(app.variables$fcs.files[[i]]) > 0 && length(input[[paste0("t_1_cm_sel_",i)]])>0 && input[[paste0("t_1_cm_sel_",i)]]!="")
+              if(i%in%highlighted.population)
+              {
+                pop.type <- c(pop.type, rep("Highlighted", nrow(x$Expr[[i]])))
+              }
+              else
+              {
+                pop.type <- c(pop.type, rep("Others", nrow(x$Expr[[i]])))
+              }
+              mat <- rbind(mat, x$Expr[[i]])
+            }
+
+
+            m1 <- as.integer(markers[which(colnames(mat)==m1)][[1]])
+            m2 <- as.integer(markers[which(colnames(mat)==m2)][[1]])
+
+
+            df <- as.data.frame(mat)[,c(m1,m2)]
+            colnames(df) <- colnames(x$Expr[[1]])[c(m1,m2)]
+            df$Population <- as.factor(pop.type)
+            pop.colors <- c(Highlighted="green", Others="black")
+
+            viz.plot <- ggplot(df, aes(df[,1], df[,2], colour=Population)) +
+              geom_point(size=0.8) + scale_colour_manual(values=pop.colors) + xlim(c(-0.5,4.5)) + ylim(c(-0.5,4.5))
+          }
+        }
+      }
+
+      return(viz.plot)
+    })
+
+  observeEvent(input$t_3_mix_validate,
+               {
+                 shinyjs::disable("t_3_mix_validate")
+                 if(!is.null(input$t_3_mix_r1_sel) && !is.null(input$t_3_mix_r2_sel))
+                 {
+                   id.1 <- as.numeric(input$t_3_mix_r1_sel)
+                   ref.1 <- app.variables$ref.objects[[id.1]]
+                   ref.1.name <- ref.1$Name
+                   populations.1 <- as.numeric(input$t_3_mix_r1_pop_sel)
+
+                   id.2 <- as.numeric(input$t_3_mix_r2_sel)
+                   ref.2 <- app.variables$ref.objects[[id.2]]
+                   ref.2.name <- ref.2$Name
+                   populations.2 <- as.numeric(input$t_3_mix_r2_pop_sel)
+
+                   if(length(ref.1)>0 && length(ref.2)>0)
+                   {
+                     progress <- Progress$new()
+                     progress$set(message = "Adding the file to references", value = 0)
+                     tmp.name <- paste0("MIX_",id.1,"_",id.2,
+                                        "__",ref.1.name,"__",ref.2.name)
+                     if(length(app.variables$mix.objects)>0 && !is.null(app.variables$mix.objects[[tmp.name]]))
+                     {
+                       app.variables$ref.objects[[length(app.variables$ref.objects)+1]] <- app.variables$mix.objects[[tmp.name]]
+
+                       mix.id <- which(names(app.variables$mix.objects)==tmp.name)[[1]]
+                       app.variables$mix.objects <- app.variables$mix.objects[-mix.id]
+
+                     }
+                     progress$set(message = "File added", value = 1)
+                     delay(500, progress$close())
+                   }
+                 }
+                 delay(300, shinyjs::enable("t_3_mix_validate"))
+               })
+  #===================================================================
+
+
+
+
+
+
+
+  #4 - GENERATE GROUPS FROM A MODEL
+  #===================================================================
+  observe( #REF HEATMAP
+    {
+      ref.hm.plot <- NULL
+
+      id <- as.numeric(input$t_4_ref_sel)
+      if(!is.na(id) && id <= length(app.variables$ref.objects))
+      {
+        ref <- app.variables$ref.objects[[id]]
+        ref.name <- ref$Name
+        markers <- ref$Markers
+        annotation.column <- ref$AnnotationColumn
+        comp <- ref$Compensated
+        transf <- ref$Transformed
+
+        if(length(ref)>0)
+        {
+          x <- ref$FCSG2
+          ref.pop.mat <- matrix(nrow=length(x$Expr), ncol=length(markers))
+          colnames(ref.pop.mat) <- colnames(x$Expr[[1]])[markers]
+          rownames(ref.pop.mat) <- rep("", nrow(ref.pop.mat))
+          for(k in 1:length(x$Expr))
+          {
+            mat <- x$Expr[[k]]
+            rownames(ref.pop.mat)[k] <- mat[1,annotation.column]
+            for(j in markers)
+            {
+              ref.pop.mat[k,j] <- mean(mat[,j])
+            }
+          }
+          ref.hm.plot <- heatmaply(ref.pop.mat, Rowv = T, Colv="Rowv", dendrogram = "none", limits = c(-0.5,4.5))
+        }
+      }
+      output[[paste0("t_4_hm_ref")]] <- renderPlotly(ref.hm.plot)
+    })
+
+  output$t_4_hm_list <- renderUI( #PLOT HEATMAPS
+    {
+      hm.ui <- NULL
+
+      if(!is.null(input$t_4_ref_sel))
+      {
+        id <- as.numeric(input$t_4_ref_sel)
+        if(!is.na(id) && id<=length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          ref.name <- ref$Name
+          markers <- ref$Markers
+          annotation.column <- ref$AnnotationColumn
+          comp <- ref$Compensated
+          transf <- ref$Transformed
+
+          if(length(ref)>0)
+          {
+            if(length(app.variables$group.objects[[ref.name]])>0)
+            {
+              hm.ui <- lapply(1:length(app.variables$group.objects[[ref.name]]), function(i)
+              {
+                tmp.ref <- app.variables$group.objects[[ref.name]][[i]]
+                x <- app.variables$group.objects[[ref.name]][[i]]$FCSG2
+
+                tmp.id <- i
+                tmp.ui <- tagList(
+                  shinydashboard::box(
+                    width = 12,
+                    collapsible = T, collapsed = T,
+                    title=tmp.ref$Name,
+                    solidHeader=T,status="info",style="overflow:auto",
+                    plotlyOutput(paste0("t_4_hm_list_",tmp.id,"_plot"), width = "100%")
+                  )
+                )
+
+                pop.mat <- matrix(nrow=length(x$Expr), ncol=length(markers))
+                colnames(pop.mat) <- colnames(x$Expr[[1]])[markers]
+                rownames(pop.mat) <- rep("", nrow(pop.mat))
+                for(k in 1:length(x$Expr))
                 {
-                    file.type <- input[[paste0("t_1_cm_sel_",i)]]
-                    if(file.type==2)
+                  mat <- x$Expr[[k]]
+                  rownames(pop.mat)[k] <- mat[1,annotation.column]
+                  for(j in markers)
+                  {
+                    pop.mat[k,j] <- mean(mat[,j])
+                  }
+                }
+                pop.mat <- isolate(pop.mat)
+                pop.plot <- heatmaply(pop.mat, Rowv = T, Colv="Rowv", dendrogram = "none", limits = c(-0.5,4.5))
+                output[[paste0("t_4_hm_list_",tmp.id,"_plot")]] <- renderPlotly(isolate(pop.plot))
+
+                return(tmp.ui)
+              })
+            }
+          }
+        }
+      }
+
+      return(hm.ui)
+    })
+
+  observeEvent(input$t_4_generate,
+               {
+                 shinyjs::disable("t_4_generate")
+                 if(!is.null(input$t_4_ref_sel))
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Generating the Files", value = 0)
+
+                   id <- as.numeric(input$t_4_ref_sel)
+                   ref <- app.variables$ref.objects[[id]]
+
+
+                   if(length(ref)>0)
+                   {
+                     ref.name <- ref$Name
+
+                     if( length(app.variables$group.objects)>0 && (ref.name%in%names(app.variables$group.objects)) )
+                     {
+                       app.variables$group.objects[[ref.name]] <- NULL
+                     }
+
+                     shifted.markers <- as.numeric(input$t_4_shifted_markers)
+
+                     nmb.files <- as.numeric(input$t_4_nmb_files)
+                     m.shift <- as.numeric(input$t_4_mean_shift)
+                     sd.shift <- as.numeric(input$t_4_sd_shift)
+
+                     markers <- ref$Markers
+                     annotation.column <- ref$AnnotationColumn
+                     comp <- ref$Compensated
+                     transf <- ref$Transformed
+
+                     fcsg2.list <- generate.FCSG2.files.from.reference(ref.object = ref$FCSG2, nmb.files = nmb.files,
+                                                                       markers.to.change = shifted.markers, markers.to.invert = NULL,
+                                                                       m.shift = m.shift, sd.shift = sd.shift)
+
+                     app.variables$ref.objects[[id]]$GroupSize <- app.variables$ref.objects[[id]]$GroupSize+nmb.files
+
+                     tmp.obj.list <- lapply(1:length(fcsg2.list), function(i)
+                     {
+                       x <- fcsg2.list[[i]]
+                       tmp.name <- paste0(i, "_", ref$Name)
+
+                       tmp.obj <- list("FCSG2"=x,
+                                       "Transformed"=transf,
+                                       "Compensated"=comp,
+                                       "Name"=tmp.name,
+                                       "AnnotationColumn"=annotation.column,
+                                       "Markers"=markers )
+                       return(tmp.obj)
+                     })
+
+
+                     if(length(app.variables$group.objects)==0)
+                     {
+                       app.variables$group.objects <- list()
+                     }
+                     if( !(ref.name%in%names(app.variables$group.objects)) )
+                     {
+                       app.variables$group.objects[[ref.name]] <- list()
+                     }
+                     for(tmp.obj in tmp.obj.list)
+                     {
+                       app.variables$group.objects[[ref.name]][[length(app.variables$group.objects[[ref.name]])+1]] <- tmp.obj
+                     }
+
+                     progress$set(message = "Files Generated", value = 1)
+                   }
+
+                   delay(500, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_4_generate"))
+               })
+  #===================================================================
+
+
+
+
+
+
+
+  #6.1 - HEATMAPS VISUALIZATIONS
+  #===================================================================
+  output$t_6_hm_sb_1 <- renderSunburst(
+    {
+      file.plot <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        id <- as.integer(input$t_6_hm_ref1_sel)
+        if(!is.null(id) && id <= length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          if(length(ref) > 0)
+          {
+            tmp.mat <- matrix(ncol = 2, nrow=length(ref$FCSG2$Expr))
+
+            tmp.mat[,1] <- 1:nrow(tmp.mat)
+            tmp.mat[,2] <- as.numeric(unlist(ref$FCSG2$Frequencies))
+            colnames(tmp.mat) <- c("level1", "size")
+
+            tmp.df <- data.frame(tmp.mat, stringsAsFactors = T)
+            tmp.tree <- d3_nest(tmp.df, value_cols = "size")
+            file.plot <- sunburst(tmp.tree, legend = TRUE)
+          }
+        }
+      }
+      return(file.plot)
+    })
+
+  output$t_6_hm_sb_2 <- renderSunburst(
+    {
+      file.plot <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        id <- as.integer(input$t_6_hm_ref2_sel)
+        if(!is.null(id) && id <= length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          if(length(ref) > 0)
+          {
+            tmp.mat <- matrix(ncol = 2, nrow=length(ref$FCSG2$Expr))
+
+            tmp.mat[,1] <- 1:nrow(tmp.mat)
+            tmp.mat[,2] <- as.numeric(unlist(ref$FCSG2$Frequencies))
+            colnames(tmp.mat) <- c("level1", "size")
+
+            tmp.df <- data.frame(tmp.mat, stringsAsFactors = T)
+            tmp.tree <- d3_nest(tmp.df, value_cols = "size")
+            file.plot <- sunburst(tmp.tree, legend = TRUE)
+          }
+        }
+      }
+      return(file.plot)
+    })
+
+  output$t_6_hm_1 <- renderPlotly(
+    {
+      hm.plot <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        id <- as.integer(input$t_6_hm_ref1_sel)
+        if(!is.null(id) && id <= length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          if(length(ref) > 0)
+          {
+            markers <- ref$Markers
+            annotation.column <- ref$AnnotationColumn
+
+            pop.mat <- matrix(nrow=length(ref$FCSG2$Expr), ncol=length(markers))
+            colnames(pop.mat) <- colnames(ref$FCSG2$Expr[[1]])[markers]
+            rownames(pop.mat) <- rep("", nrow(pop.mat))
+
+            for(i in 1:length(ref$FCSG2$Expr))
+            {
+              mat <- ref$FCSG2$Expr[[i]]
+              rownames(pop.mat)[i] <- mat[1,annotation.column]
+              for(j in markers)
+              {
+                pop.mat[i,j] <- mean(mat[,j])
+              }
+            }
+            hm.plot <- heatmaply(pop.mat, Rowv = T, Colv="Rowv", dendrogram = "none", limits = c(-0.5,4.5))
+          }
+        }
+      }
+      return(hm.plot)
+    })
+
+  output$t_6_hm_2 <- renderPlotly(
+    {
+      hm.plot <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        id <- as.integer(input$t_6_hm_ref2_sel)
+        if(!is.null(id) && id <= length(app.variables$ref.objects))
+        {
+          ref <- app.variables$ref.objects[[id]]
+          if(length(ref) > 0)
+          {
+            markers <- ref$Markers
+            annotation.column <- ref$AnnotationColumn
+
+            pop.mat <- matrix(nrow=length(ref$FCSG2$Expr), ncol=length(markers))
+            colnames(pop.mat) <- colnames(ref$FCSG2$Expr[[1]])[markers]
+            rownames(pop.mat) <- rep("", nrow(pop.mat))
+
+            for(i in 1:length(ref$FCSG2$Expr))
+            {
+              mat <- ref$FCSG2$Expr[[i]]
+              rownames(pop.mat)[i] <- mat[1,annotation.column]
+              for(j in markers)
+              {
+                pop.mat[i,j] <- mean(mat[,j])
+              }
+            }
+            hm.plot <- heatmaply(pop.mat, Rowv = T, Colv="Rowv", dendrogram = "none", limits = c(-0.5,4.5))
+          }
+        }
+      }
+      return(hm.plot)
+    })
+  #===================================================================
+
+
+
+
+
+  #6.2 - JOYPLOTS VISUALIZATIONS
+  #===================================================================
+  observe( #MARKERS
+    {
+      markers.list <- list(NULL=NULL)
+      if(length(app.variables$ref.objects)>0)
+      {
+        ids <- as.integer(input$t_6_jp_ref_sel)
+        if(!is.null(ids) && length(ids)>0)
+        {
+          markers.list <- NULL
+          for(id in ids)
+          {
+            if(!is.na(id) && id <= length(app.variables$ref.objects))
+            {
+              ref <- app.variables$ref.objects[[id]]
+              if(length(ref) > 0)
+              {
+                tmp.markers.names <- colnames(ref$FCSG2$Expr[[1]])[ref$Markers]
+                if(is.null(markers.list))
+                {
+                  markers.list <- tmp.markers.names
+                }
+                else
+                {
+                  markers.list <- intersect(markers.list, tmp.markers.names)
+                }
+              }
+            }
+          }
+          names(markers.list) <- markers.list
+        }
+      }
+      updateSelectInput(session, "t_6_jp_marker_sel", choices = markers.list, selected = markers.list)
+    })
+
+  output$t_6_jp <- renderPlot(
+    {
+      jp.plot <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        ids <- as.integer(input$t_6_jp_ref_sel)
+        if(!is.null(ids) && length(ids)>0)
+        {
+          x <- NULL
+          marker <- input$t_6_jp_marker_sel
+          if(length(marker)>0 && !is.null(marker))
+          {
+            for(id in ids)
+            {
+              tmp.id <- NULL
+              if(!is.na(id) && id <= length(app.variables$ref.objects))
+              {
+                ref <- app.variables$ref.objects[[id]]
+                if(length(ref)>0)
+                {
+                  tmp.id <- which(colnames(ref$FCSG2$Expr[[1]])[ref$Markers] == marker)
+                  if(length(tmp.id) > 0)
+                  {
+                    tmp.id <- tmp.id[[1]]
+                  }
+
+                  for(pop in 1:length(ref$FCSG2$Expr))
+                  {
+                    if(is.null(x))
                     {
-                        app.variables$fcs.files[[i]][["type"]] <<- "MUT"
+                      x <- data.frame(par=ref$FCSG2$Expr[[pop]][,tmp.id],
+                                      file=ref$Name)
                     }
                     else
                     {
-                        app.variables$fcs.files[[i]][["type"]] <<- "CTRL"
+                      x <- rbind(x, data.frame(par=ref$FCSG2$Expr[[pop]][,tmp.id],
+                                               file=ref$Name))
                     }
+                  }
 
                 }
-            })
-        }
-    })
-
-    output$t_1_pop_list <- renderUI(
-    {
-        pop.ui <- list()
-        if(length(input$t_1_nmb_populations)>0 && !is.na(input$t_1_nmb_populations) &&
-           as.numeric(input$t_1_nmb_populations)>0 && input$t_1_tb=="A" &&
-           length(input$t_1_nmb_rare_populations)>0 && !is.na(input$t_1_nmb_rare_populations) &&
-           as.numeric(input$t_1_nmb_rare_populations)>=0 && input$tabs=="t_1")
-        {
-            pop.ui <- lapply(1:(as.numeric(input$t_1_nmb_populations)-as.numeric(input$t_1_nmb_rare_populations)), function(i)
+              }
+            }
+            if(!is.null(x))
             {
-                nmb.non.rare.pop <- as.numeric(input$t_1_nmb_populations)-as.numeric(input$t_1_nmb_rare_populations)
-                effective.perc <- 100
-                if(!is.na(input$t_1_freq_rare_populations))
-                {
-                    effective.perc <- max(0,100-input$t_1_freq_rare_populations)
-                }
-                val <- tagList(
-                    column(
-                        width=4,
-                        textInput(paste0("t_1_pop_",i,"_name"), "Population Name", value = i)
-                    ),
-                    column(
-                        width=3,
-                        numericInput(paste0("t_1_pop_",i,"min__freq"), "Min Frequency", value = trunc(effective.perc/nmb.non.rare.pop*100)/100)
-                    ),
-                    column(
-                        width=3,
-                        numericInput(paste0("t_1_pop_",i,"max__freq"), "Max Frequency", value = trunc(effective.perc/nmb.non.rare.pop*100)/100+1)
-                    )
+              x$file <- as.factor(x$file)
+              jp.plot <- ggplot(x, aes(x=par,y=file)) + geom_density_ridges2() +
+                xlab(marker) + ylab("density") + xlim(c(-0.5,4.5))
+            }
+          }
+        }
+      }
+
+      return(jp.plot)
+    })
+  #===================================================================
+
+
+
+
+
+  #6.3 - SCATTER PLOT VISUALIZATIONS
+  #===================================================================
+  output$t_6_sc <- renderPlot(
+    {
+      markers.plot <- NULL
+      if(!is.null(input$t_6_sc_ref_sel))
+      {
+        m1 <- as.integer(input[["t_6_sc_m1_sel"]])
+        m2 <- as.integer(input[["t_6_sc_m2_sel"]])
+
+        id <- as.numeric(input$t_6_sc_ref_sel)
+        ref <- app.variables$ref.objects[[id]]
+        if(length(ref)>0 && !is.null(m1) && !is.null(m2))
+        {
+          ref.name <- ref$Name
+
+          annotation.column <- ref$AnnotationColumn
+          highlighted.population <- as.numeric(input$t_6_sc_hp)
+
+          if( !(m1==m2) )
+          {
+            x <- ref$FCSG2
+
+            mat <- NULL
+            pop.type <- NULL
+            for(i in 1:length(x$Expr))
+            {
+              if(i%in%highlighted.population)
+              {
+                pop.type <- c(pop.type, rep("Highlighted", nrow(x$Expr[[i]])))
+              }
+              else
+              {
+                pop.type <- c(pop.type, rep("Others", nrow(x$Expr[[i]])))
+              }
+              mat <- rbind(mat, x$Expr[[i]])
+            }
+
+            df <- as.data.frame(mat)[,c(m1,m2)]
+            colnames(df) <- colnames(x$Expr[[1]])[c(m1,m2)]
+            df$Population <- as.factor(pop.type)
+            pop.colors <- c(Highlighted="green", Others="black")
+
+            markers.plot <- ggplot(df, aes(df[,1], df[,2], colour=Population)) +
+              geom_point(size=0.8) + scale_colour_manual(values=pop.colors) + xlim(c(-0.5,4.5)) + ylim(c(-0.5,4.5)) +
+              xlab(colnames(df)[1]) + ylab(colnames(df)[2])
+          }
+        }
+      }
+
+      return(markers.plot)
+    })
+  #===================================================================
+
+
+
+
+
+
+
+  #7 - Decompensate, Detransform
+  #===================================================================
+  output$t_7_files <- renderUI(
+    {
+      files.ui <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        files.ui <- lapply(1:length(app.variables$ref.objects), function(i)
+        {
+          tmp.ui <- NULL
+
+          ref <- app.variables$ref.objects[[i]]
+          if(length(ref)>0)
+          {
+            comp <- p("False", style="color:red")
+            if(ref$Compensated)
+            {
+              comp <- p("True", style="color:green")
+            }
+            transf <- p("False", style="color:red")
+            if(ref$Transformed)
+            {
+              transf <- p("True", style="color:green")
+            }
+
+            tmp.ui <- tagList(
+              fluidRow
+              (
+                style="margin-bottom:2%",
+                column
+                (
+                  width=2,
+                  checkboxInput(paste0("t_7_file_",i), "", value = F)
+                ),
+                column
+                (
+                  width=4,
+                  h5(ref$Name)
+                ),
+                column
+                (
+                  width=3,
+                  tags$b(comp)
+                ),
+                column
+                (
+                  width=3,
+                  tags$b(transf)
                 )
-                return(val)
-            })
-            return(pop.ui)
-        }
-        return(pop.ui)
-    })
-
-    observe( #UPDATE NUMBER MIN MARKERS
-    {
-        if(!is.na(input$t_1_nmb_populations) && !is.na(input$t_1_nmb_markers) && input$tabs=="t_1")
-        {
-            if(as.numeric(input$t_1_nmb_populations) > 2^as.numeric(input$t_1_nmb_markers))
-            {
-                updateNumericInput(session, "t_1_nmb_markers", "Number of Markers", value=as.integer(log2(as.numeric(input$t_1_nmb_populations)))+1)
-            }
-        }
-    })
-
-
-
-
-
-
-
-    #=======================================MODIFY POPULATIONS===========================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                f.name <- input[["t_2_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    shinyjs::show("t_2_plot_div")
-                    shinyjs::show("t_2_right_col")
-                    shinyjs::enable("t_2_pop_inc")
-                    shinyjs::enable("t_2_pop_red")
-                    shinyjs::enable("t_2_pop_new")
-                }
-                else
-                {
-                    hide("t_2_plot_div")
-                    hide("t_2_right_col")
-                    shinyjs::disable("t_2_pop_inc")
-                    shinyjs::disable("t_2_pop_red")
-                    shinyjs::disable("t_2_pop_new")
-                }
-            }
-            else
-            {
-                hide("t_2_plot_div")
-                hide("t_2_right_col")
-                shinyjs::disable("t_2_pop_inc")
-                shinyjs::disable("t_2_pop_red")
-                shinyjs::disable("t_2_pop_new")
-            }
-        }
-        else
-        {
-            hide("t_2_plot_div")
-            hide("t_2_right_col")
-            shinyjs::disable("t_2_pop_inc")
-            shinyjs::disable("t_2_pop_red")
-            shinyjs::disable("t_2_pop_new")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list(2)
-    })
-
-    observe( #UPDATE FILES LIST
-    {
-        update.files.list(2)
-    })
-
-    observe( #UPDATE MARKERS LIST
-    {
-        markers.list <- list()
-        selected.markers <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                f.name <- input[["t_2_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    if(app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_2_set_list"]])
-                    {
-                        markers.list <- app.variables$fcs.files[[f.name]][["markers"]]
-                    }
-                }
-            }
-            selected.markers <- markers.list
-            if(!is.na(input$t_2_markers_list) && length(input$t_2_markers_list)>0)
-            {
-                selected.markers <- as.list(unlist(input$t_2_markers_list)[input$t_2_markers_list%in%markers.list])
-            }
-            if(length(selected.markers)>0)
-            {
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    pop.col <- app.variables$fcs.files[[f.name]][["populations_column"]]
-                    pop.col <- app.variables$fcs.files[[f.name]][["markers"]][[pop.col]]
-                    #==
-                    selected.markers <- as.list(unlist(selected.markers)[which(selected.markers!=pop.col)])
-                }
-            }
-        }
-        updateSelectInput(session, "t_2_markers_list", "Select Markers", choices = markers.list, selected = selected.markers)
-    })
-
-    observe( #UPDATE VISUALIZED MARKERS LIST
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            markers.list <- list()
-            selected.markers.1 <- NULL
-            selected.markers.2 <- NULL
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_markers_list"]])>0 && input[["t_2_markers_list"]]!="")
-                {
-                    f.name <- input[["t_2_file_list"]]
-                    if(length(app.variables$fcs.files[[f.name]])>0)
-                    {
-                        markers.list <- input[["t_2_markers_list"]]
-                    }
-                }
-            }
-            if(!is.na(input$t_2_m1) && input$t_2_m1!="")
-            {
-                selected.markers.1 <- as.list(unlist(input$t_2_m1)[input$t_2_m1%in%markers.list])
-            }
-            else
-            {
-                selected.markers.1 <- markers.list
-            }
-            if(!is.na(input$t_2_m2) && input$t_2_m2!="")
-            {
-                selected.markers.2 <- as.list(unlist(input$t_2_m2)[input$t_2_m2%in%markers.list])
-            }
-            else
-            {
-                selected.markers.2 <- markers.list
-            }
-
-            updateSelectInput(session, "t_2_m1", "Select 1st Marker", choices = markers.list, selected = selected.markers.1)
-            updateSelectInput(session, "t_2_m2", "Select 2nd Marker", choices = markers.list, selected = selected.markers.2)
-        }
-    })
-
-    output$t_2_means <- renderUI(
-    {
-        rendered.UI <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_markers_list"]])>0)
-                {
-                    if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]]!="")
-                    {
-                        f.name <- input[["t_2_file_list"]]
-                        if(length(app.variables$fcs.files[[f.name]])>0)
-                        {
-                            tmp.mat <- app.variables$output.matrices[[f.name]]
-                            markers.list <- input[["t_2_markers_list"]]
-                            current.pop <- input$t_2_pop_list
-
-                            min.value <- as.numeric(input[["t_2_min_value"]])
-                            max.value <- as.numeric(input[["t_2_max_value"]])
-
-                            rendered.UI <- lapply(1:length(markers.list), function(j)
-                            {
-                                tmp.UI <- NULL
-                                used.value <- min.value
-                                if(length(app.variables$fcs.files[[f.name]][["markers_default_values"]][[current.pop]])>0)
-                                {
-                                    used.value <- app.variables$fcs.files[[f.name]][["markers_default_values"]][[current.pop]][[1]][[j]]
-                                }
-                                if(length(input[[paste0("t_2_mean_",j)]])>0 && input[[paste0("t_2_mean_",j)]]!="")
-                                {
-                                    used.value <- input[[paste0("t_2_mean_",j)]]
-                                }
-                                marker.name <- markers.list[[j]]
-                                marker.id <- which(app.variables$fcs.files[[f.name]][["markers"]] == marker.name)
-                                if(length(marker.id)>0)
-                                {
-                                    marker.id <- as.numeric(marker.id[[1]])
-                                    mean.step <- trunc(1000*((min.value+max.value)/100))/1000
-                                    tmp.UI <- sliderInput(paste0("t_2_mean_",j), marker.name,
-                                                          min = min.value,
-                                                          max = max.value,
-                                                          step=mean.step,
-                                                          value=used.value,
-                                                          width = "80%")
-                                }
-                                return(tmp.UI)
-                            })
-                        }
-                    }
-                }
-            }
-        }
-    })
-
-    output$t_2_sd <- renderUI(
-    {
-        rendered.UI <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_markers_list"]])>0)
-                {
-                    if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]]!="")
-                    {
-                        f.name <- input[["t_2_file_list"]]
-                        if(length(app.variables$fcs.files[[f.name]])>0)
-                        {
-                            tmp.mat <- app.variables$output.matrices[[f.name]]
-                            markers.list <- input[["t_2_markers_list"]]
-                            current.pop <- input$t_2_pop_list
-
-                            min.value <- as.numeric(input[["t_2_min_value"]])
-                            max.value <- as.numeric(input[["t_2_max_value"]])
-
-                            rendered.UI <- lapply(1:length(markers.list), function(j)
-                            {
-                                tmp.UI <- NULL
-                                used.value <- min.value
-                                if(length(app.variables$fcs.files[[f.name]][["markers_default_values"]][[current.pop]])>0)
-                                {
-                                    used.value <- app.variables$fcs.files[[f.name]][["markers_default_values"]][[current.pop]][[2]][[j]]
-                                }
-                                if(length(input[[paste0("t_2_sd_",j)]])>0 && input[[paste0("t_2_sd_",j)]]!="")
-                                {
-                                    used.value <- input[[paste0("t_2_sd_",j)]]
-                                }
-                                marker.name <- markers.list[[j]]
-                                marker.id <- which(app.variables$fcs.files[[f.name]][["markers"]] == marker.name)
-                                if(length(marker.id)>0)
-                                {
-                                    marker.id <- as.numeric(marker.id[[1]])
-                                    sd.max <- (min.value+max.value)/5
-                                    sd.step <- trunc(1000*sd.max/100)/1000
-                                    tmp.UI <- sliderInput(paste0("t_2_sd_",j), marker.name,
-                                                          min = 0,
-                                                          max = sd.max,
-                                                          step=sd.step,
-                                                          value=used.value,
-                                                          width = "80%")
-                                }
-                                return(tmp.UI)
-                            })
-                        }
-                    }
-                }
-            }
-        }
-    })
-
-    observe( #UPDATE POPULATIONS LIST
-    {
-        pop.list <- list()
-        selected.pop <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_set_list"]])>0)
-            {
-                if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-                {
-                    f.name <- input[["t_2_file_list"]]
-                    if(length(app.variables$fcs.files[[f.name]])>0 && app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_2_set_list"]])
-                    {
-                        f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-                        fcs.temp <- app.variables$fcs.files[[f.name]]
-                        fcs.mat <- app.variables$output.matrices[[f.name]]
-                        pop.list <- list()
-                        for(i in 1:length(app.variables$populations.list[[f.name]]))
-                        {
-                            if(length(app.variables$populations.list[[f.name]][[i]])>0)
-                            {
-                                pop.list <- list(unlist(pop.list), names(app.variables$populations.list[[f.name]])[i])
-                            }
-                        }
-                    }
-                }
-                pop.list <- unlist(pop.list)
-                selected.pop <- pop.list
-                if(!is.na(input$t_2_pop_list) && input$t_2_pop_list!="")
-                {
-                    selected.pop <- as.list(unlist(input$t_2_pop_list)[input$t_2_pop_list%in%pop.list])
-                }
-            }
-        }
-        updateSelectInput(session, "t_2_pop_list", "Select a Population", choices=pop.list, selected = selected.pop)
-    })
-
-    observe( #UPDATE MARKERS DEFAULT VALUES
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                f.name <- input[["t_2_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    tmp.mat <- app.variables$output.matrices[[f.name]]
-                    if(length(app.variables$populations.list[[f.name]])>0)
-                    {
-                        lapply(1:length(app.variables$populations.list[[f.name]]), function(i)
-                        {
-                            if(length(app.variables$populations.list[[f.name]][[i]])>0)
-                            {
-                                pop <- tmp.mat[as.numeric(app.variables$populations.list[[f.name]][[i]]),]
-                                if(length(app.variables$populations.list[[f.name]][[i]])==1)
-                                {
-                                    pop <- t(tmp.mat[as.numeric(app.variables$populations.list[[f.name]][[i]]),])
-                                }
-                                pop.name <- names(app.variables$populations.list[[f.name]])[i]
-                                app.variables$fcs.files[[f.name]][["markers_default_values"]][[pop.name]] <-  extract.position.from.pop(pop)
-                            }
-                        })
-                    }
-                }
-            }
-        }
-    })
-
-    observe( #UPDATE SD ET MEAN SLIDERS VALUES
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]] != "")
-                {
-                    f.name <- input[["t_2_file_list"]]
-                    if(length(app.variables$fcs.files[[f.name]])>0 &&
-                       length(app.variables$fcs.files[[f.name]][["markers_default_values"]])>0)
-                    {
-                        markers.values <- app.variables$fcs.files[[f.name]][["markers_default_values"]][[input[["t_2_pop_list"]]]]
-                        lapply(1:length(markers.values[[1]]), function(i)
-                        {
-                            updateSliderInput(session, paste0("t_2_mean_",i), value = markers.values[[1]][[i]])
-                            updateSliderInput(session, paste0("t_2_sd_",i), value = markers.values[[2]][[i]])
-                        })
-                    }
-                }
-            }
-        }
-    })
-
-    observeEvent(input$t_2_pop_new, #ADD NEW POP
-    {
-        shinyjs::disable("t_2_pop_new")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "" &&
-               app.variables$fcs.files[[input[["t_2_file_list"]]]][["set"]] ==  input[["t_2_set_list"]])
-            {
-                if(length(input[["t_2_pop_events"]])>0 && input[["t_2_pop_events"]] != "")
-                {
-                    progress <- Progress$new()
-                    progress$set(message = "Adding Population", value = 0)
-
-                    fcs.id <- which(names(app.variables$fcs.files) == input[["t_2_file_list"]])[[1]]
-
-                    tmp.matrix <- matrix(nrow=as.numeric(input[["t_2_pop_events"]]),
-                                         ncol=ncol(app.variables$output.matrices[[input[["t_2_file_list"]]]]))
-
-                    pop.col <- app.variables$fcs.files[[fcs.id]][["populations_column"]]
-                    for(i in (1:ncol(tmp.matrix))[-pop.col])
-                    {
-                        m.orig <- runif(1,
-                                        as.numeric(input$t_2_min_value),
-                                        as.numeric(input$t_2_max_value))
-                        sd.orig <- runif(1,0,1)*1.76
-
-                        tmp.matrix[,i] <- rtruncnorm(as.numeric(input[["t_2_pop_events"]]),
-                                                     as.numeric(input$t_2_min_value),
-                                                     as.numeric(input$t_2_max_value),
-                                                     m.orig,
-                                                     sd.orig)
-
-                        progress$inc(1/(ncol(tmp.matrix)-1), detail = "Creating points")
-                    }
-                    tmp.matrix[,pop.col] <- max(app.variables$output.matrices[[fcs.id]][,pop.col])+1
-                    first.id <- nrow(app.variables$output.matrices[[fcs.id]])+1
-
-                    app.variables$output.matrices[[fcs.id]] <<-
-                        rbind(app.variables$output.matrices[[fcs.id]],
-                              tmp.matrix)
-                    app.variables$populations.list[[fcs.id]][[length(app.variables$populations.list[[fcs.id]])+1]] <<-
-                        first.id:(first.id+nrow(tmp.matrix)-1)
-                    names(app.variables$populations.list[[fcs.id]])[[length(app.variables$populations.list[[fcs.id]])]] <<-
-                        length(app.variables$populations.list[[fcs.id]])
-                    app.variables$used.events[[fcs.id]] <<- c(unlist(app.variables$used.events[[fcs.id]]), rep(T,nrow(tmp.matrix)))
-
-                    progress$set(message = "Population added", value = 1)
-                    delay(700, progress$close())
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_2_pop_new"))
-    })
-
-    observeEvent(input$t_2_pop_inc, #INCREASE POP SIZE
-    {
-        shinyjs::disable("t_2_pop_inc")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "" &&
-               length(app.variables$fcs.files[[input[["t_2_file_list"]]]])>0 &&
-               app.variables$fcs.files[[input[["t_2_file_list"]]]][["set"]] ==  input[["t_2_set_list"]])
-            {
-                if(length(input[["t_2_pop_events"]])>0 && input[["t_2_pop_events"]] != "")
-                {
-                    if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]] != "")
-                    {
-
-                        f.name <- input[["t_2_file_list"]]
-                        pop.list <- app.variables$populations.list[[f.name]]
-                        current.pop <- as.numeric(which(names(pop.list)%in%input[["t_2_pop_list"]])[[1]])
-
-                        progress <- Progress$new()
-                        progress$set(message = paste0("Increasing size of ", input[["t_2_pop_list"]]), value = 0)
-
-                        #AUGMENTATION DE LA TAILLE DE LA POP
-                        pop.col <- app.variables$fcs.files[[f.name]][["populations_column"]]
-                        if(length(pop.list[[current.pop]])>0)
-                        {
-                            pop <- app.variables$output.matrices[[f.name]][ pop.list[[current.pop]], ]
-                            inc.coef <- 100*as.numeric(input[["t_2_pop_events"]])/nrow(pop)
-                            new.mat <- create.pop.from.pop(pop, inc.coef, unused.columns = pop.col, limited=T)
-                            first.id <- nrow(app.variables$output.matrices[[f.name]])
-
-                            app.variables$output.matrices[[f.name]] <<- rbind(app.variables$output.matrices[[f.name]],
-                                                                              new.mat)
-                            app.variables$populations.list[[f.name]][[current.pop]] <<-
-                                c(unlist(pop.list[[current.pop]]), (first.id+1):(first.id+nrow(new.mat)))
-                            app.variables$used.events[[f.name]] <<- c(app.variables$used.events[[f.name]],
-                                                                      rep(T,nrow(new.mat)))
-                        }
-
-                        progress$inc(1, detail = "done")
-                        progress$set(message = "Size increased", value = 1)
-
-                        delay(700, progress$close())
-                    }
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_2_pop_inc"))
-    })
-
-    observeEvent(input$t_2_pop_red, #DECREASE POP SIZE
-    {
-        shinyjs::disable("t_2_pop_red")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "" &&
-               length(app.variables$fcs.files[[input[["t_2_file_list"]]]])>0 &&
-               app.variables$fcs.files[[input[["t_2_file_list"]]]][["set"]] ==  input[["t_2_set_list"]])
-            {
-                if(length(input[["t_2_pop_events"]])>0 && input[["t_2_pop_events"]] != "")
-                {
-                    if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]] != "")
-                    {
-                        f.name <- input[["t_2_file_list"]]
-                        pop.list <- app.variables$populations.list[[f.name]]
-                        current.pop <- as.numeric(which(names(pop.list)%in%input[["t_2_pop_list"]])[[1]])
-
-                        progress <- Progress$new()
-                        progress$set(message = paste0("Reducing size of ", input[["t_2_pop_list"]]), value = 0)
-
-                        #AUGMENTATION DE LA TAILLE DE LA POP
-                        pop.col <- app.variables$fcs.files[[f.name]][["populations_column"]]
-
-                        if(length(pop.list[[current.pop]])>0)
-                        {
-                            pop <- app.variables$output.matrices[[f.name]][ pop.list[[current.pop]], ]
-                            red.coef <- 100*as.numeric(input[["t_2_pop_events"]])/nrow(pop)
-                            if(red.coef>100)
-                            {
-                                red.coef <- 100
-                            }
-                            removed.events <- reduce.population(pop.list[[current.pop]], red.coef)
-                            removed.events.ids <- which(pop.list[[current.pop]]%in%removed.events)
-
-                            app.variables$used.events[[f.name]][removed.events] <<- F
-                            app.variables$populations.list[[f.name]][[current.pop]] <<- pop.list[[current.pop]][-removed.events.ids]
-                        }
-
-                        progress$inc(1, detail = "done")
-                        progress$set(message = "Size decreased", value = 1)
-                        delay(700, progress$close())
-                    }
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_2_pop_red"))
-    })
-
-    output$t_2_plot <- renderPlot( #RENDER PLOT
-    {
-        output.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_m1"]])>0 && input[["t_2_m1"]] != "")
-                {
-                    if(length(input[["t_2_m2"]])>0 && input[["t_2_m2"]] != "")
-                    {
-                        if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]] != "")
-                        {
-                            f.name <- isolate(input[["t_2_file_list"]])
-                            if(length(app.variables$fcs.files[[f.name]])>0 &&
-                               app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_2_set_list"]])
-                            {
-                                used.events <- app.variables$used.events[[f.name]]
-                                fcs.mat <- app.variables$output.matrices[[f.name]][used.events, ]
-                                f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-
-                                m1.id <- which(app.variables$fcs.files[[f.name]][["markers"]]==input[["t_2_m1"]])[[1]]
-                                m2.id <- which(app.variables$fcs.files[[f.name]][["markers"]]==input[["t_2_m2"]])[[1]]
-
-                                pop.num <- rep("Other",nrow(app.variables$output.matrices[[f.name]]))
-                                pop.events <- as.numeric(unlist(app.variables$populations.list[[f.name]][[input[["t_2_pop_list"]]]]))
-                                if(length(pop.events)>0)
-                                {
-                                    pop.num[pop.events] <- "Selected Population"
-                                }
-                                pop.num <- pop.num[used.events]
-                                tmp.dataframe <- data.frame(P1=unlist(fcs.mat[,as.integer(m1.id)]),
-                                                            P2=unlist(fcs.mat[,as.integer(m2.id)]),
-                                                            pop=unlist(pop.num))
-                                tmp.dataframe$pop <- as.factor(tmp.dataframe$pop)
-
-                                output.plot <- ggplot(tmp.dataframe, aes(x=P1, y=P2, color=pop)) +
-                                    geom_point(size = 0.1, stroke = 0, shape = 16) +
-                                    xlab(input[["t_2_m1"]]) +
-                                    ylab(input[["t_2_m2"]]) +
-                                    theme(legend.position = "top") +
-                                    xlim(as.numeric(input[["t_2_min_value"]]), as.numeric(input[["t_2_max_value"]])) +
-                                    ylim(as.numeric(input[["t_2_min_value"]]), as.numeric(input[["t_2_max_value"]]))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return(output.plot)
-    })
-
-    observeEvent(input$t_2_pop_move, #MOVE POPULATION AVEC SLIDERS
-    {
-        shinyjs::disable("t_2_pop_move")
-
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]] != "")
-                {
-                    progress <- Progress$new()
-                    progress$set("Moving Population", value=0)
-
-                    f.name <- input[["t_2_file_list"]]
-                    if(length(app.variables$fcs.files[[f.name]])>0 && app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_2_set_list"]])
-                    {
-                        f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-
-                        pop.column <- app.variables$fcs.files[[f.name]][["populations_column"]]
-                        markers.values <- app.variables$fcs.files[[f.name]][["markers_default_values"]][[input[["t_2_pop_list"]]]]
-                        markers.list <- (1:length(markers.values[[1]]))[-pop.column]
-                        events.list <- app.variables$populations.list[[f.name]][[input[["t_2_pop_list"]]]]
-                        if(length(events.list)>0)
-                        {
-                            current.pop <- app.variables$output.matrices[[f.name]][events.list,-pop.column]
-                            mean.list <- c()
-                            sd.list <- c()
-
-                            for(i in 1:length(markers.values[[1]]))
-                            {
-                                if(length(input[[paste0("t_2_mean_",i)]])>0 && input[[paste0("t_2_mean_",i)]] != "")
-                                {
-                                    mean.list[[i]] <- as.numeric(input[[paste0("t_2_mean_",i)]])
-                                    sd.list[[i]] <- as.numeric(input[[paste0("t_2_sd_",i)]])
-                                }
-                                else
-                                {
-                                    mean.list[[i]] <- markers.values[[1]][[i]]
-                                    sd.list[[i]] <- markers.values[[2]][[i]]
-                                }
-                                progress$inc(1/length(markers.values[[1]]),
-                                             detail=paste0(app.variables$fcs.files[[f.name]][["markers"]][[i]], " changed"))
-                            }
-                            if(length(mean.list)>0)
-                            {
-                                app.variables$output.matrices[[f.name]][events.list,markers.list] <<-
-                                    move.population(current.pop, mean.list, sd.list, limited=T,
-                                                    max.val = as.numeric(input[["t_2_max_value"]]),
-                                                    min.val = as.numeric(input[["t_2_min_value"]]))
-                            }
-                        }
-                    }
-                    progress$set(paste0(input[["t_2_pop_list"]], " moved"), value=1)
-                    delay(500, progress$close())
-                }
-            }
-        }
-
-
-        delay(500, shinyjs::enable("t_2_pop_move"))
-    })
-
-    observeEvent(input$t_2_pop_remove, #DEL POPULATION
-    {
-        shinyjs::disable("t_2_pop_remove")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_2")
-        {
-            if(length(input[["t_2_file_list"]])>0 && input[["t_2_file_list"]] != "")
-            {
-                if(length(input[["t_2_pop_list"]])>0 && input[["t_2_pop_list"]] != "")
-                {
-                    progress <- Progress$new()
-                    progress$set("Deleting Population", value=0)
-                    f.name <- input[["t_2_file_list"]]
-                    if(length(app.variables$fcs.files[[f.name]])>0 && app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_2_set_list"]])
-                    {
-                        f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-
-                        pop.column <- app.variables$fcs.files[[f.name]][["populations_column"]]
-
-                        events.list <- app.variables$populations.list[[f.name]][[input[["t_2_pop_list"]]]]
-                        if(length(events.list)>0)
-                        {
-                            app.variables$used.events[[f.name]][events.list] <<- F
-                            app.variables$populations.list[[f.name]][[input[["t_2_pop_list"]]]] <<- list()
-                        }
-                    }
-                    progress$set(paste0(input[["t_2_pop_list"]], " removed"), value=1)
-                    delay(500, progress$close())
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_2_pop_remove"))
-    })
-
-
-
-
-
-
-
-
-
-    #========================================GENERATE CONTROL FILES================================================
-
-
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_3")
-        {
-            if(length(input[["t_3_file_list"]])>0 && input[["t_3_file_list"]] != "")
-            {
-                f.name <- input[["t_3_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    shinyjs::show("t_3_2")
-                    shinyjs::show("t_3_3")
-                    shinyjs::enable("t_3_control_generate")
-                }
-                else
-                {
-                    hide("t_3_2")
-                    hide("t_3_3")
-                    shinyjs::disable("t_3_control_generate")
-                }
-            }
-            else
-            {
-                hide("t_3_2")
-                hide("t_3_3")
-                shinyjs::disable("t_3_control_generate")
-            }
-        }
-        else
-        {
-            hide("t_3_2")
-            hide("t_3_3")
-            shinyjs::disable("t_3_control_generate")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list(3)
-    })
-
-    observe( #UPDATE FILES LIST
-    {
-        update.files.list(3)
-    })
-
-    observe( #UPDATE MARKERS LIST
-    {
-        markers.list <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input[["t_3_file_list"]])>0 && input[["t_3_file_list"]] != "")
-            {
-                f.name <- input[["t_3_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]]) > 0 && app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_3_set_list"]])
-                {
-                    f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-                    markers.list <- unlist(app.variables$fcs.files[[f.name]][["markers"]])
-
-                    pop.col <- app.variables$fcs.files[[f.name]][["populations_column"]]
-                    markers.list <- markers.list[-pop.col]
-                }
-            }
-        }
-        updateSelectInput(session, "t_3_var_markers_list", "Select 1st Marker", choices = markers.list, selected = markers.list)
-    })
-
-    observe( #UPDATE POPULATIONS LIST
-    {
-        pop.list <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input[["t_3_set_list"]])>0)
-            {
-                if(length(input[["t_3_file_list"]])>0 && input[["t_3_file_list"]] != "")
-                {
-                    f.name <- input[["t_3_file_list"]]
-
-                    if(length(app.variables$fcs.files[[f.name]]) > 0 && app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_3_set_list"]] &&
-                       length(app.variables$populations.list[[f.name]])>0)
-                    {
-                        fcs.temp <- app.variables$fcs.files[[f.name]]
-                        fcs.mat <- app.variables$output.matrices[[f.name]]
-
-                        pop.list <- list()
-                        for(i in 1:length(app.variables$populations.list[[f.name]]))
-                        {
-                            if(length(app.variables$populations.list[[f.name]][[i]])>0)
-                            {
-                                pop.list <- list(unlist(pop.list), names(app.variables$populations.list[[f.name]])[i])
-                            }
-                        }
-                        pop.list <- unlist(pop.list)
-                    }
-                }
-            }
-        }
-        updateSelectInput(session, "t_3_var_pop_list", "Select a Population", choices=pop.list, selected = pop.list)
-    })
-
-    observeEvent(input$t_3_control_generate,#GENERATE CONTROL FILES
-    {
-        shinyjs::disable("t_3_control_generate")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input[["t_3_set_list"]])>0)
-            {
-                if(length(input[["t_3_file_list"]])>0 && input[["t_3_file_list"]] != "")
-                {
-                    if(length(input[["t_3_var_markers_list"]])>0 && input[["t_3_var_markers_list"]] != "")
-                    {
-                        if(length(input[["t_3_var_pop_list"]])>0 && input[["t_3_var_pop_list"]] != "")
-                        {
-                            f.name <- input[["t_3_file_list"]]
-                            if(length(app.variables$fcs.files[[f.name]])> 0 && app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_3_set_list"]])
-                            {
-                                progress <- Progress$new()
-                                progress$set(message = "Generating Control Files", value = 0)
-                                update.log("GENERATING CONTROL FILES")
-
-                                used.events <- app.variables$used.events[[f.name]]
-                                f.set <- app.variables$fcs.files[[f.name]][["set"]]
-                                f.mat <- app.variables$output.matrices[[f.name]]
-                                f.populations <- app.variables$populations.list[[f.name]]
-                                update.log(paste("==== FROM:", f.name))
-
-                                nmb.files <- as.numeric(input[["t_3_nmb_ctrl"]])
-                                unused.markers <- as.numeric(unlist(which(!(app.variables$fcs.files[[f.name]][["markers"]]%in%input[["t_3_var_markers_list"]]))))
-                                selected.populations <- as.numeric(unlist(which(names(app.variables$populations.list[[f.name]])%in%input[["t_3_var_pop_list"]])))
-
-
-                                update.log(paste("==== MODIFIED POPULATIONS:",  list.to.string(input[["t_3_var_pop_list"]])))
-                                update.log(paste("==== VARIABLE MARKERS:",  list.to.string(input[["t_3_var_markers_list"]])))
-
-
-                                lapply(1:nmb.files, function(curr.file)
-                                {
-                                    tmp.mat <- f.mat
-                                    lapply(selected.populations, function(curr.pop)
-                                    {
-                                        if(length(f.populations[[curr.pop]])>0)
-                                        {
-                                            if(length(f.populations[[curr.pop]])==1)
-                                            {
-                                                pop <- t(tmp.mat[f.populations[[curr.pop]],])
-                                                pop.position <- extract.position.from.pop(pop, unused.markers)
-
-                                                tmp.mat[f.populations[[curr.pop]], ] <<-
-                                                    t(move.population(pop, pop.position[[1]], pop.position[[2]],
-                                                                      limited = T, unused.columns = unused.markers))
-                                            }
-                                            else
-                                            {
-
-                                                pop <- tmp.mat[f.populations[[curr.pop]],]
-                                                pop.position <- extract.position.from.pop(pop, unused.markers)
-
-                                                tmp.mat[f.populations[[curr.pop]], ] <<-
-                                                    move.population(pop, pop.position[[1]], pop.position[[2]],
-                                                                    limited = T, unused.columns = unused.markers)
-                                            }
-
-                                        }
-                                    })
-
-                                    tmp.name <<- paste0("CTRL_",f.name,"_", trunc(as.numeric(Sys.time())))
-                                    app.variables$output.matrices[[tmp.name]] <<- as.matrix(tmp.mat)
-                                    app.variables$used.events[[tmp.name]] <<- used.events
-                                    app.variables$populations.list[[tmp.name]] <<- isolate(app.variables$populations.list[[f.name]])
-                                    app.variables$fcs.files[[tmp.name]] <<- isolate(app.variables$fcs.files[[f.name]])
-                                    app.variables$fcs.files[[tmp.name]][["file"]]@exprs <<- as.matrix(tmp.mat)
-                                    app.variables$fcs.files[[tmp.name]][["name"]] <<- tmp.name
-                                    app.variables$fcs.files[[tmp.name]][["type"]] <<- "CTRL"
-                                    app.variables$fcs.files[[tmp.name]][["source_ctrl"]] <<- input[["t_3_set_list"]]
-                                    progress$inc(1/nmb.files, detail=paste0("CTRL ", curr.file," generated"))
-                                    update.log(paste("========", tmp.name, "generated"))
-                                })
-
-
-                                progress$set(message = "Control Files Generated", value = 1)
-                                update.log("CONTROL FILES GENERATED")
-                                update.log("")
-                                delay(500, progress$close())
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_3_control_generate"))
-    })
-
-
-
-
-
-
-
-    #===========================================GENERATE MUTANTS===================================================
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_6")
-        {
-            if(length(input[["t_6_files_list"]])>0 && input[["t_6_files_list"]] != "")
-            {
-                f.name <- input[["t_6_files_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    shinyjs::enable("t_6_mut_generate")
-                }
-                else
-                {
-                    shinyjs::disable("t_6_mut_generate")
-                }
-            }
-            else
-            {
-                shinyjs::disable("t_6_mut_generate")
-            }
-        }
-        else
-        {
-            shinyjs::disable("t_6_mut_generate")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list(6)
-    })
-
-    observe( #UPDATE FILES LIST
-    {
-        files.list <- list()
-        selected.file <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(!is.na(input[["t_6_set_list"]])  && input[["t_6_set_list"]]!="")
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] ==  input[["t_6_set_list"]] &&
-                       app.variables$fcs.files[[i]][["type"]] == "CTRL")
-                    {
-                        files.list[[length(files.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                    }
-                }
-            }
-            selected.file <- files.list
-            if(!is.na(input$t_6_files_list) && input$t_6_files_list!="")
-            {
-                selected.file <- input$t_6_files_list
-            }
-        }
-        updateSelectInput(session, "t_6_files_list", "Select Control Files", choices=files.list, selected=selected.file)
-    })
-
-    output$t_6_1 <- renderUI( #RENDER UI POUR LE CTRL
-    {
-        rendered.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_6_files_list)>0 && input$t_6_files_list != "")
-            {
-                current.ctrl <- input$t_6_files_list
-                #==
-                if(length(app.variables$fcs.files[[current.ctrl]])>0 &&
-                   app.variables$fcs.files[[current.ctrl]][["set"]] ==  input[["t_6_set_list"]])
-                {
-                    mutant.list <- list()
-                    for(i in 1:length(app.variables$fcs.files))
-                    {
-                        if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] ==  input[["t_6_set_list"]])
-                        {
-                            if(app.variables$fcs.files[[i]][["set"]] ==  input[["t_6_set_list"]] && app.variables$fcs.files[[i]][["type"]] == "MUT" &&
-                               app.variables$fcs.files[[i]][["source_ctrl"]] == current.ctrl)
-                            {
-                                mutant.list[[length(mutant.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                            }
-                        }
-                    }
-                    #=
-                    pop.list <- app.variables$populations.list[[current.ctrl]]
-                    pop.tags <- list()
-                    if(length(mutant.list)>0 && !is.null(app.variables$loaded.mutant))
-                    {
-                        if(length(app.variables$reduction.percentages[[app.variables$loaded.mutant]])>0)
-                        {
-                            pop.tags <- lapply(1:length(pop.list), function(current.pop)
-                            {
-                                return(tagList(
-                                    column(
-                                        width=4,
-                                        h4(names(pop.list)[[current.pop]])
-                                    ),
-                                    column(
-                                        width=8,
-                                        numericInput(paste0("t_6_val_",current.pop), "Size Reduction %",
-                                                     value=app.variables$reduction.percentages[[app.variables$loaded.mutant]][[current.pop]])
-                                    )
-                                ))
-                            })
-                        }
-                        else
-                        {
-                            pop.tags <- lapply(1:length(pop.list), function(current.pop)
-                            {
-                                return(tagList(
-                                    column(
-                                        width=4,
-                                        h4(current.pop)
-                                    ),
-                                    column(
-                                        width=8,
-                                        numericInput("t_6_val_", "Reduction %", value=0)
-                                    )
-                                ))
-                            })
-                        }
-
-                    }
-                    #=
-                    rendered.ui <- box(
-                        title=app.variables$fcs.files[[input$t_6_files_list]][["name"]],
-                        width=12, collapsible=T,
-                        column(
-                            width=7,
-                            div(
-                                width="90%",style="padding:0",
-                                column(
-                                    width=9,style="padding:0",
-                                    selectInput("t_6_mutants_list", NULL, choices = mutant.list, width="100%")
-                                ),
-                                column(
-                                    width=2,style="padding:0;margin-left:1%",
-                                    actionButton("t_6_load_mutant", "Load", width="100%")
-                                )
-                            )
-                        ),
-                        column(
-                            width=5,
-                            pop.tags
-                        )
-                    )
-                }
-            }
-        }
-        return(rendered.ui)
-    })
-
-    observeEvent(input[["t_6_load_mutant"]], #OBSERVE EVENT DU BOUTON LOAD MUTANT
-    {
-        shinyjs::disable("t_6_load_mutant")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_6_files_list)>0 && input$t_6_files_list != "")
-            {
-                if(length(app.variables$fcs.files[[input$t_6_files_list]])>0 &&
-                   app.variables$fcs.files[[input$t_6_files_list]][["set"]] ==  input[["t_6_set_list"]])
-                {
-                    progress <- Progress$new()
-                    progress$set(message = "Loading Mutant", value = 0)
-                    current.mut <- input[["t_6_mutants_list"]]
-                    app.variables$loaded.mutant <<- current.mut
-
-                    pop.list <- app.variables$populations.list[[input$t_6_files_list]]
-                    if(length(pop.list)>0)
-                    {
-                        if(length(app.variables$reduction.percentages[[current.mut]])>0)
-                        {
-                            sapply(1:length(pop.list), function(j)
-                            {
-                                updateNumericInput(session, paste0("t_6_val_",j), "Reduction %",
-                                                   value=app.variables$reduction.percentages[[current.mut]][[j]])
-                            })
-                        }
-                    }
-
-                    progress$set(message = "Mutant loaded", value = 1)
-                    delay(500, progress$close())
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_6_load_mutant"))
-    })
-
-    add.mutant <- function(ctrl.name)
-    {
-        shinyjs::disable("t_6_mut_add")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(ctrl.name)>0 && ctrl.name != "")
-            {
-                if(length(app.variables$fcs.files[[ctrl.name]]) > 0 &&
-                   app.variables$fcs.files[[ctrl.name]][["set"]] ==  input[["t_6_set_list"]])
-                {
-                    progress <- Progress$new()
-                    progress$set(message = "Adding Mutant", value = 0)
-
-                    f.name <- app.variables$fcs.files[[ctrl.name]][["name"]]
-                    tmp.name <- paste0("MUT_",f.name,"_",trunc(as.numeric(Sys.time())))
-                    app.variables$output.matrices[[tmp.name]] <<- isolate(app.variables$output.matrices[[ctrl.name]])
-                    app.variables$populations.list[[tmp.name]] <<- isolate(app.variables$populations.list[[ctrl.name]])
-                    app.variables$fcs.files[[tmp.name]] <<- isolate(app.variables$fcs.files[[ctrl.name]])
-                    app.variables$fcs.files[[tmp.name]][["type"]] <<- "MUT"
-                    app.variables$fcs.files[[tmp.name]][["source_ctrl"]] <<- ctrl.name
-                    app.variables$fcs.files[[tmp.name]][["name"]] <<- tmp.name
-                    app.variables$fcs.files[[tmp.name]][["file"]]@exprs <<- isolate(app.variables$output.matrices[[ctrl.name]])
-                    app.variables$reduction.percentages[[tmp.name]] <<- rep(0,length(app.variables$populations.list[[ctrl.name]]))
-                    app.variables$used.events[[tmp.name]] <<- isolate(app.variables$used.events[[ctrl.name]])
-
-                    progress$set(message = "Mutant added", value = 1)
-                    update.log(paste(f.name, input$t_6_set_list))
-
-                    delay(500, progress$close())
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_6_mut_add"))
-    }
-
-    observeEvent(input[["t_6_mut_add"]], #OBSERVE EVENT DU BOUTON ADD MUTANT
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(app.variables$fcs.files[[input$t_6_set_list]])>0)
-            {
-                update.log(paste("CREATING MUTANT FOR COHORT:", input$t_6_set_list))
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]]==input$t_6_set_list &&
-                       (app.variables$fcs.files[[i]][["type"]]=="CTRL" || app.variables$fcs.files[[i]][["type"]] == "SRC"))
-                    {
-                        add.mutant(app.variables$fcs.files[[i]][["name"]])
-                    }
-                }
-                update.log("========COHORT CREATED")
-            }
-        }
-
-
-    }, ignoreNULL = T)
-
-    observe( #SAVE REDUCTION %
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_6_files_list)>0 && input$t_6_files_list != "")
-            {
-                if(length(input[["t_6_mutants_list"]])>0 && input[["t_6_mutants_list"]]!="" &&
-                   length(app.variables$fcs.files[[input[["t_6_mutants_list"]]]])>0 &&
-                   app.variables$fcs.files[[input[["t_6_mutants_list"]]]][["set"]] ==  input[["t_6_set_list"]])
-                {
-                    current.mutant <- app.variables$loaded.mutant
-                    if(!is.null(current.mutant) && length(app.variables$fcs.files[[current.mutant]])>0)
-                    {
-                        pop.list <- app.variables$populations.list[[input$t_6_files_list]]
-                        if(length(pop.list)>0)
-                        {
-                            app.variables$reduction.percentages[[current.mutant]] <<- sapply(1:length(pop.list), function(j)
-                            {
-                                return(as.numeric(input[[paste0("t_6_val_",j)]]))
-                            })
-                        }
-                    }
-                }
-            }
-        }
-    })
-
-    observeEvent(input$t_6_mut_generate, #GENERATE MUTANTS
-    {
-         shinyjs::disable("t_6_mut_generate")
-         if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-         {
-             if(!is.na(input$t_6_files_list) && input$t_6_files_list != "")
-             {
-                 if(length(app.variables$fcs.files[[input$t_6_files_list]]))
-                 {
-                     mutant.list <- list()
-                     for(i in 1:length(app.variables$fcs.files))
-                     {
-                         if(length(app.variables$fcs.files[[i]])>0)
-                         {
-                             if(app.variables$fcs.files[[i]][["set"]] ==  input[["t_6_set_list"]] && app.variables$fcs.files[[i]][["type"]] == "MUT")
-                             {
-                                 mutant.list[[length(mutant.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                             }
-                         }
-                     }
-                     if(length(mutant.list)>0)
-                     {
-                         progress <- Progress$new()
-                         progress$set(message = "Generating Mutants", value = 0)
-                         lapply(1:length(mutant.list), function(i)
-                         {
-                             if(length(app.variables$reduction.percentages[[mutant.list[[i]]]]) > 0)
-                             {
-                                 app.variables$output.matrices[[mutant.list[[i]]]] <<- app.variables$fcs.files[[mutant.list[[i]]]][["file"]]@exprs
-                                 pop.list <- app.variables$populations.list[[input$t_6_files_list]]
-                                 if(length(pop.list)>0)
-                                 {
-                                     nmb.events.moved <- 0
-                                     nmb.pop.increased <- 0
-                                     #REDUCTION
-                                     lapply(1:length(pop.list), function(j)
-                                     {
-                                         red.coef <- app.variables$reduction.percentages[[mutant.list[[i]]]][j]
-                                         if(red.coef>0)
-                                         {
-                                             removed.events <- reduce.population(pop.list[[j]], red.coef)
-                                             #==
-                                             app.variables$used.events[[mutant.list[[i]]]][removed.events] <<- F
-                                             #==
-                                             nmb.events.moved <<- nmb.events.moved+length(removed.events)
-                                             app.variables$populations.list[[mutant.list[[i]]]][[j]] <<-
-                                                 pop.list[[j]][!(pop.list[[j]]%in%removed.events)]
-                                         }
-                                         else
-                                         {
-                                             nmb.pop.increased <<- nmb.pop.increased+1
-                                         }
-                                     })
-                                     #AUGMENTATION DE LA TAILLE DES AUTRES POPS
-                                     if(nmb.pop.increased>0 && nmb.events.moved>0)
-                                     {
-                                         nmb.events.per.pop <- as.integer(nmb.events.moved/nmb.pop.increased)
-                                         pop.col <- app.variables$fcs.files[[mutant.list[[i]]]][["populations_column"]]
-                                         lapply(1:length(pop.list), function(j)
-                                         {
-                                             red.coef <- app.variables$reduction.percentages[[mutant.list[[i]]]][j]
-                                             if(red.coef<=0 && length(pop.list[[j]])>0)
-                                             {
-                                                 pop <- as.matrix(app.variables$output.matrices[[mutant.list[[i]]]][ pop.list[[j]], ])
-                                                 if(length(pop.list[[j]])==1)
-                                                 {
-                                                     pop <- t(pop)
-                                                 }
-
-                                                 inc.coef <- 100*nmb.events.per.pop/nrow(pop)
-                                                 if(inc.coef>(10^(-9)))
-                                                 {
-                                                     new.mat <- create.pop.from.pop(pop, inc.coef, unused.columns = pop.col, limited=T)
-                                                     first.id <- nrow(app.variables$output.matrices[[mutant.list[[i]]]])
-
-                                                     app.variables$output.matrices[[mutant.list[[i]]]] <<- rbind(app.variables$output.matrices[[mutant.list[[i]]]],
-                                                                                                                 new.mat)
-                                                     app.variables$populations.list[[mutant.list[[i]]]][[j]] <<-
-                                                         c(unlist(pop.list[[j]]), (first.id+1):(first.id+nrow(new.mat)))
-                                                     app.variables$used.events[[mutant.list[[i]]]] <<- c(app.variables$used.events[[mutant.list[[i]]]],
-                                                                                                         rep(T,nrow(new.mat)))
-                                                 }
-                                             }
-                                         })
-                                     }
-                                 }
-                             }
-                             progress$inc(1/length(mutant.list), detail=paste0(mutant.list[[i]], " generated"))
-                         })
-                         progress$set(message = "Mutants Generated", value = 1)
-                         delay(500, progress$close())
-                     }
-                 }
-             }
-         }
-         delay(500, shinyjs::enable("t_6_mut_generate"))
-    })
-
-
-
-
-
-
-
-
-    #==============================================MIX FILES=======================================================
-
-
-
-
-
-
-
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list(7)
-    })
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_7")
-        {
-            if(length(input[["t_7_source_list"]])>0 && input[["t_7_source_list"]] != "" &&
-               length(input[["t_7_target_list"]])>0 && input[["t_7_target_list"]] != "")
-            {
-                source.name <- input[["t_7_source_list"]]
-                target.name <- input[["t_7_target_list"]]
-                if(length(app.variables$fcs.files[[source.name]])>0 && length(app.variables$fcs.files[[target.name]])>0)
-                {
-                    shinyjs::show("t_7_left")
-                    shinyjs::show("t_7_right")
-                    shinyjs::enable("t_7_mix")
-                }
-                else
-                {
-                    shinyjs::hide("t_7_left")
-                    shinyjs::hide("t_7_right")
-                    shinyjs::disable("t_7_mix")
-                }
-            }
-            else
-            {
-                shinyjs::hide("t_7_left")
-                shinyjs::hide("t_7_right")
-                shinyjs::disable("t_7_mix")
-            }
-        }
-        else
-        {
-            shinyjs::hide("t_7_left")
-            shinyjs::hide("t_7_right")
-            shinyjs::disable("t_7_mix")
-        }
-    })
-
-    observe( #UPDATE SOURCE AND TARGET LIST
-    {
-        files.list <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            for(i in 1:length(app.variables$fcs.files))
-            {
-                if(length(app.variables$fcs.files[[i]])>0 && length(input$t_7_set_list)>0 && input$t_7_set_list!= "" &&
-                   app.variables$fcs.files[[i]][["set"]] == input$t_7_set_list)
-                {
-                    files.list[[length(files.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                }
-            }
-        }
-        updateSelectInput(session, "t_7_source_list", "Select Source File", choices=files.list)
-        updateSelectInput(session, "t_7_target_list", "Select Target File", choices=files.list)
-    })
-
-    output$t_7_pop_tab <- renderUI( #GENERATE POP LIST
-    {
-        pop.ui <- list()
-        if(length(input$t_7_set_list)>0 && input$t_7_set_list!="")
-        {
-            if(length(input$t_7_source_list)>0 && !is.na(input$t_7_source_list))
-            {
-                if(length(input$t_7_target_list)>0 && !is.na(input$t_7_target_list))
-                {
-                    source.name <- input$t_7_source_list
-                    target.name <- input$t_7_target_list
-
-                    if(length(app.variables$fcs.files[[source.name]])>0 && length(app.variables$fcs.files[[target.name]])>0)
-                    {
-                        source.pop.list <- list()
-                        source.pop.list.size <- list()
-                        for(i in 1:length(app.variables$populations.list[[source.name]]))
-                        {
-                            if(length(app.variables$populations.list[[source.name]])>0)
-                            {
-                                pop.name <- names(app.variables$populations.list[[source.name]])[i]
-                                source.pop.list[[i]] <- pop.name
-                                source.pop.list.size[[pop.name]] <- unlist(app.variables$populations.list[[source.name]][[i]])
-                            }
-                        }
-                        source.pop.list <- unlist(source.pop.list)
-
-                        target.pop.list <- list()
-                        target.pop.list.size <- list()
-                        for(i in 1:length(app.variables$populations.list[[target.name]]))
-                        {
-                            if(length(app.variables$populations.list[[target.name]])>0)
-                            {
-                                pop.name <- names(app.variables$populations.list[[target.name]])[i]
-                                target.pop.list[[i]] <- pop.name
-                                target.pop.list.size[[pop.name]] <- unlist(app.variables$populations.list[[target.name]][[i]])
-                            }
-                        }
-                        target.pop.list <- unlist(target.pop.list)
-
-                        pop.ui <- tagList(
-                            fluidRow(
-                                column(
-                                    width=2,
-                                    p("Population Name")
-                                ),
-                                column(
-                                    width=2,
-                                    p("Events")
-                                ),
-                                column(
-                                    width=2,
-                                    p("Frequency")
-                                ),
-                                column(
-                                    width=2,
-                                    p("Copy from pop ?")
-                                ),
-                                column(
-                                    width=2,
-                                    p("% of events to copy")
-                                ),
-                                column(
-                                    width=2,
-                                    p("Target pop to copy to")
-                                )
-                            )
-                        )
-
-                        pop.ui <- list(pop.ui, lapply(1:length(source.pop.list), function(i)
-                        {
-                            tmp.ui <- tagList(
-                                fluidRow(
-                                    column(
-                                        width=2,
-                                        h6(source.pop.list[[i]])
-                                    ),
-                                    column(
-                                        width=2,
-                                        h6(length(source.pop.list.size[[i]]))
-                                    ),
-                                    column(
-                                        width=2,
-                                        h6(paste0(trunc(10000*length(source.pop.list.size[[i]])/sum(app.variables$used.events[[source.name]]))/100, " %"))
-                                    ),
-                                    column(
-                                        width=2,
-                                        checkboxInput(paste0("t_7_pop_",i,"_cb"), NULL, value=T)
-                                    ),
-                                    column(
-                                        width=2,
-                                        numericInput(paste0("t_7_pop_",i,"_perc"), NULL, value=0)
-                                    ),
-                                    column(
-                                        width=2,
-                                        selectInput(paste0("t_7_pop_",i,"_targ"), NULL, choices=target.pop.list)
-                                    )
-                                )
-                            )
-                            return(tmp.ui)
-                        }))
-                    }
-                }
-            }
-        }
-        return(pop.ui)
-    })
-
-    observe( #UPDATE MARKERS LIST
-    {
-        markers.list <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_7_source_list)>0 && !is.na(input$t_7_source_list))
-            {
-                if(length(input$t_7_target_list)>0 && !is.na(input$t_7_target_list))
-                {
-                    source.name <- input$t_7_source_list
-                    target.name <- input$t_7_target_list
-
-                    if(length(app.variables$fcs.files[[source.name]])>0 && length(app.variables$fcs.files[[target.name]])>0)
-                    {
-                        markers.list <- unlist(app.variables$fcs.files[[source.name]][["markers"]])
-                        markers.list <- markers.list[markers.list%in%app.variables$fcs.files[[target.name]][["markers"]]]
-
-                        pop.col.source <- app.variables$fcs.files[[source.name]][["populations_column"]]
-                        pop.col.target <- app.variables$fcs.files[[target.name]][["populations_column"]]
-                        markers.list <- markers.list[-c(pop.col.source,pop.col.target)]
-                    }
-                }
-            }
-        }
-        updateSelectInput(session, "t_7_m1", "1st Marker", choices = markers.list, selected = markers.list)
-        updateSelectInput(session, "t_7_m2", "2nd Marker", choices = markers.list, selected = markers.list)
-    })
-
-    observe( #UPDATE POPULATIONS LIST
-    {
-        source.pop.list <- list()
-        target.pop.list <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_7_source_list)>0 && !is.na(input$t_7_source_list))
-            {
-                if(length(input$t_7_target_list)>0 && !is.na(input$t_7_target_list))
-                {
-                    source.name <- input$t_7_source_list
-                    target.name <- input$t_7_target_list
-
-                    if(length(app.variables$fcs.files[[source.name]])>0 && length(app.variables$fcs.files[[target.name]])>0)
-                    {
-                        source.pop.list <- list()
-                        for(i in 1:length(app.variables$populations.list[[source.name]]))
-                        {
-                            if(length(app.variables$populations.list[[source.name]][[i]])>0)
-                            {
-                                source.pop.list <- list(unlist(source.pop.list), names(app.variables$populations.list[[source.name]])[i])
-                            }
-                        }
-                        source.pop.list <- unlist(source.pop.list)
-
-                        target.pop.list <- list()
-                        for(i in 1:length(app.variables$populations.list[[target.name]]))
-                        {
-                            if(length(app.variables$populations.list[[target.name]][[i]])>0)
-                            {
-                                target.pop.list <- list(unlist(target.pop.list), names(app.variables$populations.list[[target.name]])[i])
-                            }
-                        }
-                        target.pop.list <- unlist(target.pop.list)
-                    }
-                }
-            }
-        }
-        updateSelectInput(session, "t_7_pops_list", "Source Population", choices = source.pop.list, selected = source.pop.list)
-        updateSelectInput(session, "t_7_popt_list", "Target Population", choices = target.pop.list, selected = target.pop.list)
-    })
-
-    observeEvent(input$t_7_mix,
-    {
-        shinyjs::disable("t_7_mix")
-        source.pop.list <- list()
-        target.pop.list <- list()
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_7_source_list)>0 && !is.na(input$t_7_source_list))
-            {
-                if(length(input$t_7_target_list)>0 && !is.na(input$t_7_target_list))
-                {
-                    source.name <- input$t_7_source_list
-                    target.name <- input$t_7_target_list
-
-                    if(length(app.variables$fcs.files[[source.name]])>0 && length(app.variables$fcs.files[[target.name]])>0)
-                    {
-                        progress <- Progress$new()
-                        progress$set("Mixing files populations", value=0)
-
-                        source.pop.list <- names(app.variables$populations.list[[source.name]])
-                        lapply(1:length(source.pop.list), function(current.source.id)
-                        {
-                            if(input$t_7_all_pop_cb || input[[paste0("t_7_pop_",current.source.id,"_cb")]])
-                            {
-                                target.pop.id <- which(names(app.variables$populations.list[[target.name]])==
-                                                           input[[paste0("t_7_pop_",current.source.id,"_targ")]])
-                                if(length(target.pop.id)>0)
-                                {
-                                    target.pop.id <- target.pop.id[[1]]
-                                    #==
-                                    tmp.val <- input[[paste0("t_7_pop_",current.source.id,"_perc")]]
-                                    extr.perc <- as.numeric(!is.na(tmp.val))*tmp.val + as.numeric(is.na(tmp.val))*0
-                                    if(extr.perc>0)
-                                    {
-                                        matching.parameters <- which(app.variables$fcs.files[[source.name]][["markers"]]%in%
-                                                                         app.variables$fcs.files[[target.name]][["markers"]])
-                                        if(length(matching.parameters)>0)
-                                        {
-                                            matching.parameters <- as.numeric(unlist(matching.parameters))
-                                            if(length(matching.parameters)==length(app.variables$fcs.files[[target.name]][["markers"]]))
-                                            {
-                                                current.source.pop.events <- app.variables$populations.list[[source.name]][[current.source.id]]
-                                                nmb.events <- length(current.source.pop.events)
-                                                selected.events <- sample(current.source.pop.events, as.integer(extr.perc*nmb.events/100))
-                                                #==EXTRACTION DE L'INDICE DE LA POP TARGET DANS LA MATRICE D'EXPRESSION
-                                                target.file.pop.col <- app.variables$fcs.files[[target.name]][["populations_column"]]
-                                                target.pop <- app.variables$populations.list[[target.name]][[target.pop.id]]
-                                                target.pop.matrix.id <- app.variables$output.matrices[[target.name]][as.numeric(unlist(target.pop)),target.file.pop.col]
-                                                target.pop.matrix.id <- unique(target.pop.matrix.id)
-                                                target.mat.nrow <- nrow(app.variables$output.matrices[[target.name]])
-                                                #==
-                                                app.variables$output.matrices[[target.name]] <<-
-                                                    rbind(app.variables$output.matrices[[target.name]],
-                                                          app.variables$output.matrices[[source.name]][as.numeric(unlist(selected.events)),matching.parameters])
-                                                #==
-                                                app.variables$populations.list[[target.name]][[target.pop.id]] <<-
-                                                    c(unlist(app.variables$populations.list[[target.name]][[target.pop.id]]),
-                                                      (target.mat.nrow+1):(target.mat.nrow+length(selected.events)))
-                                                target.pop <- app.variables$populations.list[[target.name]][[target.pop.id]]
-                                                #==
-                                                app.variables$output.matrices[[target.name]][as.numeric(unlist(target.pop)),target.file.pop.col] <<-
-                                                    target.pop.matrix.id
-                                            }
-                                        }
-                                    }
-                                    progress$inc(1/length(source.pop.list),
-                                                 detail=paste0(source.pop.list[[current.source.id]], " to ",
-                                                               input[[paste0("t_7_pop_",current.source.id,"_cb")]]))
-                                }
-                            }
-                        })
-
-                        progress$set("Files Mixed", value=1)
-                        delay(500, progress$close())
-                    }
-                }
-            }
-        }
-        delay(500, shinyjs::enable("t_7_mix"))
-    })
-
-    output$t_7_plot_1 <- renderPlot( #RENDER PLOT
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(length(input$t_7_source_list)>0 && !is.na(input$t_7_source_list))
-            {
-                f.name <- input[["t_7_source_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    if(length(input[["t_7_m1"]])>0 && input[["t_7_m1"]] != "")
-                    {
-                        if(length(input[["t_7_m2"]])>0 && input[["t_7_m2"]] != "")
-                        {
-                            if(length(input[["t_7_pops_list"]])>0 && input[["t_7_pops_list"]] != "")
-                            {
-                                fcs.mat <- app.variables$output.matrices[[f.name]]
-                                f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-
-                                m1.id <- which(app.variables$fcs.files[[f.name]][["markers"]]==input[["t_7_m1"]])[[1]]
-                                m2.id <- which(app.variables$fcs.files[[f.name]][["markers"]]==input[["t_7_m2"]])[[1]]
-
-                                pop.num <- rep("Other",nrow(fcs.mat))
-                                pop.events <- as.numeric(unlist(app.variables$populations.list[[f.name]][[as.numeric(input[["t_7_pops_list"]])]]))
-                                if(length(pop.events)>0)
-                                {
-                                    pop.num[pop.events] <- "Selected Population"
-                                }
-                                else
-                                {
-                                }
-                                tmp.dataframe <- data.frame(P1=unlist(fcs.mat[,as.integer(m1.id)]),
-                                                            P2=unlist(fcs.mat[,as.integer(m2.id)]),
-                                                            pop=unlist(pop.num))
-                                tmp.dataframe$pop <- as.factor(tmp.dataframe$pop)
-
-                                ggplot(tmp.dataframe, aes(x=P1, y=P2, color=pop)) +
-                                    geom_point(size = 0.1, stroke = 0, shape = 16) +
-                                    xlab(input[["t_7_m1"]]) +
-                                    ylab(input[["t_7_m2"]]) +
-                                    theme(legend.position = "top") +
-                                    xlim(as.numeric(input[["t_2_min_value"]]), as.numeric(input[["t_2_max_value"]])) +
-                                    ylim(as.numeric(input[["t_2_min_value"]]), as.numeric(input[["t_2_max_value"]]))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    })
-
-    output$t_7_plot_2 <- renderPlot( #RENDER PLOT
-    {
-            if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-            {
-                if(length(input$t_7_target_list)>0 && !is.na(input$t_7_target_list))
-                {
-                    f.name <- isolate(input[["t_7_target_list"]])
-                    if(length(app.variables$fcs.files[[f.name]])>0)
-                    {
-                        if(length(input[["t_7_m1"]])>0 && input[["t_7_m1"]] != "")
-                        {
-                            if(length(input[["t_7_m2"]])>0 && input[["t_7_m2"]] != "")
-                            {
-                                if(length(input[["t_7_popt_list"]])>0 && input[["t_7_popt_list"]] != "")
-                                {
-                                    fcs.mat <- app.variables$output.matrices[[f.name]]
-                                    f.id <- which(names(app.variables$fcs.files)==f.name)[[1]]
-
-                                    m1.id <- which(app.variables$fcs.files[[f.name]][["markers"]]==input[["t_7_m1"]])[[1]]
-                                    m2.id <- which(app.variables$fcs.files[[f.name]][["markers"]]==input[["t_7_m2"]])[[1]]
-
-                                    pop.num <- rep("Other",nrow(fcs.mat))
-                                    pop.events <- as.numeric(unlist(app.variables$populations.list[[f.name]][[as.numeric(input[["t_7_popt_list"]])]]))
-                                    if(length(pop.events)>0)
-                                    {
-                                        pop.num[pop.events] <- "Selected Population"
-                                    }
-                                    else
-                                    {
-                                    }
-                                    tmp.dataframe <- data.frame(P1=unlist(fcs.mat[,as.integer(m1.id)]),
-                                                                P2=unlist(fcs.mat[,as.integer(m2.id)]),
-                                                                pop=unlist(pop.num))
-                                    tmp.dataframe$pop <- as.factor(tmp.dataframe$pop)
-
-                                    ggplot(tmp.dataframe, aes(x=P1, y=P2, color=pop)) +
-                                        geom_point(size = 0.1, stroke = 0, shape = 16) +
-                                        xlab(input[["t_7_m1"]]) +
-                                        ylab(input[["t_7_m2"]]) +
-                                        theme(legend.position = "top") +
-                                        xlim(as.numeric(input[["t_2_min_value"]]), as.numeric(input[["t_2_max_value"]])) +
-                                        ylim(as.numeric(input[["t_2_min_value"]]), as.numeric(input[["t_2_max_value"]]))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+              )
+            )
+          }
+
+          return(tmp.ui)
         })
+      }
 
+      return(files.ui)
+    })
 
-
-
-
-
-
-    #===========================================VISUALIZE MUTANTS=======================================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
+  output$t_7_detransform_param <- renderUI(
     {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_4_hm")
+      param.ui <- NULL
+      if(!is.null(input$t_7_transform_sel) && as.integer(input$t_7_transform_sel) == 2)
+      {
+        param.ui <- numericInput("t_7_arcsinh_w", "W", value=5)
+      }
+      return(param.ui)
+    })
+
+  observeEvent(input$t_7_decompensate,
+               {
+                 shinyjs::disable("t_7_decompensate")
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Decompensating Selection", value = 0)
+
+                   selected.ref <- sapply(1:length(app.variables$ref.objects), function(i)
+                   {
+                     return(as.logical(input[[paste0("t_7_file_",i)]]))
+                   })
+
+                   selected.ref <- unlist(which(selected.ref))
+                   if(length(selected.ref)>0)
+                   {
+                     for(i in selected.ref)
+                     {
+                       ref <- app.variables$ref.objects[[i]]
+                       if(length(ref)>0)
+                       {
+                         tmp.fcs <- save.object.as.FCS(ref$FCSG2)
+                         tmp.fcs <- m.inv.compensate(tmp.fcs)
+                         tmp.obj <- load.annotated.FCS.as.object(fcs = tmp.fcs, annotation.column = ref$AnnotationColumn, markers.list = ref$Markers)
+
+                         app.variables$ref.objects[[i]]$FCSG2 <- tmp.obj
+                         app.variables$ref.objects[[i]]$Compensated <- F
+                         progress$inc(1/length(selected.ref), detail=paste0(ref$Name, " decompensated"))
+                       }
+                     }
+                   }
+                   progress$set(message = "Files decompensated", value = 1)
+                   shinyjs::delay(500, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_7_decompensate"))
+               })
+
+  observeEvent(input$t_7_detransform,
+               {
+                 shinyjs::disable("t_7_detransform")
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   progress <- Progress$new()
+                   progress$set(message = "Detransforming Selection", value = 0)
+                   selected.ref <- sapply(1:length(app.variables$ref.objects), function(i)
+                   {
+                     return(as.logical(input[[paste0("t_7_file_",i)]]))
+                   })
+
+                   selected.ref <- unlist(which(selected.ref))
+                   if(length(selected.ref)>0)
+                   {
+                     for(i in selected.ref)
+                     {
+                       ref <- app.variables$ref.objects[[i]]
+                       if(length(ref)>0)
+                       {
+                         tmp.fcs <- save.object.as.FCS(ref$FCSG2)
+                         if(!is.null(input$t_7_detransform_sel))
+                         {
+                           if(as.integer(input$t_7_detransform_sel) == 1)
+                           {
+                             tmp.fcs <- m.inv.transform.logicle(tmp.fcs, colnames(ref$FCSG2$Expr[[1]])[ref$Markers])
+                           }
+                           else if(as.integer(input$t_7_detransform_sel) == 2)
+                           {
+                             w <- as.numeric(input[["t_7_arcsinh_w"]])
+                             tmp.fcs <- m.inv.transform.asinh(tmp.fcs, colnames(ref$FCSG2$Expr[[1]])[ref$Markers], w)
+                           }
+                         }
+                         tmp.obj <- load.annotated.FCS.as.object(fcs = tmp.fcs, annotation.column = ref$AnnotationColumn, markers.list = ref$Markers)
+
+                         app.variables$ref.objects[[i]]$FCSG2 <- tmp.obj
+                         app.variables$ref.objects[[i]]$Transformed <- F
+                         progress$inc(1/length(selected.ref), detail=paste0(ref$Name, " detransformed"))
+                       }
+                     }
+                   }
+                   progress$set(message = "Files Detransformed", value = 1)
+                   shinyjs::delay(500, progress$close())
+                 }
+                 delay(500, shinyjs::enable("t_7_decompensate"))
+               })
+
+  observe( #SELECT ALL
+    {
+      if(length(app.variables$ref.objects)>0)
+      {
+        if(as.logical(input$t_7_file_select_all))
         {
-            if( (length(input[["t_4_hm_file_list"]])>0 && input[["t_4_hm_file_list"]] != "") ||
-                (length(input[["t_4_hm_2_file_list"]])>0 && input[["t_4_hm_2_file_list"]] != "") )
-            {
-                f.name <- input[["t_4_hm_file_list"]]
-                f.name.2 <- input[["t_4_hm_2_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0 || length(app.variables$fcs.files[[f.name.2]])>0)
-                {
-                    shinyjs::show("t_4_hm_right")
-                }
-                else
-                {
-                    shinyjs::hide("t_4_hm_right")
-                }
-            }
-            else
-            {
-                shinyjs::hide("t_4_hm_right")
-            }
+          for(i in 1:length(app.variables$ref.objects))
+          {
+            updateCheckboxInput(session, paste0("t_7_file_",i), value = T)
+          }
         }
         else
         {
-            shinyjs::hide("t_4_hm_right")
+          for(i in 1:length(app.variables$ref.objects))
+          {
+            updateCheckboxInput(session, paste0("t_7_file_",i), value = F)
+          }
         }
+      }
     })
+  #===================================================================
 
-    observe( #UPDATE SETS LIST
+
+
+
+
+
+
+  #8 - Download
+  #===================================================================
+  output$t_8_files <- renderUI(
     {
-        update.sets.list("4_hm")
-    })
-
-    observe( #UPDATE FILES LIST
-    {
-        tab.id <- "4_hm"
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs==paste0("t_",tab.id))
+      files.ui <- NULL
+      if(length(app.variables$ref.objects)>0)
+      {
+        files.ui <- lapply(1:length(app.variables$ref.objects), function(i)
         {
-            files.list <- list()
-            selected.file <- list()
-            if(length(input[[paste0("t_",tab.id,"_set_list")]])>0)
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input[[paste0("t_",tab.id,"_set_list")]])
-                        {
-                            files.list[[length(files.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                        }
-                    }
-                }
-            }
-            selected.file <- files.list
-            if(!is.na(input[[paste0("t_",tab.id,"_file_list")]]) && input[[paste0("t_",tab.id,"_file_list")]]!="")
-            {
-                selected.file <- as.list(unlist(input[[paste0("t_",tab.id,"_file_list")]])[input[[paste0("t_",tab.id,"_file_list")]]%in%files.list])
-            }
-            updateSelectInput(session, paste0("t_",tab.id,"_file_list"), "Select 1st File", choices=files.list, selected=selected.file)
-            updateSelectInput(session, paste0("t_",tab.id,"_2_file_list"), "Select 2nd File", choices=files.list, selected=selected.file)
-        }
-    })
-
-    observe( #UPDATE MARKERS LIST
-    {
-        markers.list <- list()
-        selected.markers <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_4_hm")
-        {
-            if(length(input[["t_4_hm_file_list"]])>0 && input[["t_4_hm_file_list"]] != "")
-            {
-                f.name <- input[["t_4_hm_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    if(app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_4_hm_set_list"]])
-                    {
-                        markers.list <- app.variables$fcs.files[[f.name]][["markers"]]
-                    }
-                }
-            }
-            if(length(input[["t_4_hm_2_file_list"]])>0 && input[["t_4_hm_2_file_list"]] != "")
-            {
-                f.name <- input[["t_4_hm_2_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    if(app.variables$fcs.files[[f.name]][["set"]] ==  input[["t_4_hm_set_list"]])
-                    {
-                        if(length(markers.list)>0)
-                        {
-                            cross.markers <- which(markers.list%in%app.variables$fcs.files[[f.name]][["markers"]])
-                            markers.list <- markers.list[unlist(cross.markers)]
-                        }
-                        else
-                        {
-                            markers.list <- app.variables$fcs.files[[f.name]][["markers"]]
-                        }
-                    }
-                }
-            }
-            selected.markers <- markers.list
-            if(!is.na(input$t_4_hm_markers_list) && length(input$t_4_hm_markers_list)>0)
-            {
-                selected.markers <- as.list(unlist(input$t_4_hm_markers_list)[input$t_4_hm_markers_list%in%markers.list])
-            }
-        }
-        updateSelectInput(session, "t_4_hm_markers_list", "Select Markers", choices = markers.list, selected = selected.markers)
-    })
-
-    output$t_4_hm_sb <- renderSunburst(
-    {
-        file.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_4_hm")
-        {
-            if(length(input$t_4_hm_file_list)>0 && input$t_4_hm_file_list != "")
-            {
-                f.name <- input$t_4_hm_file_list
-                if(length(app.variables$fcs.files[[f.name]]) > 0)
-                {
-                    pop.ids <- app.variables$populations.list[[f.name]]
-
-                    tmp.mat <- matrix(ncol = 2, nrow=length(pop.ids))
-                    tmp.mat[,1] <- names(pop.ids)
-                    tmp.mat[,2] <- sapply(1:length(pop.ids), function(i){return(length(pop.ids[[i]]))})
-                    colnames(tmp.mat) <- c("level1", "size")
-
-                    tmp.df <- data.frame(tmp.mat, stringsAsFactors = T)
-                    tmp.tree <- d3_nest(tmp.df, value_cols = "size")
-                    file.plot <- sunburst(tmp.tree, legend = TRUE)
-                }
-            }
-        }
-        return(file.plot)
-    })
-
-    output$t_4_hm_sb_2 <- renderSunburst(
-    {
-        file.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_4_hm")
-        {
-            if(length(input$t_4_hm_2_file_list)>0 && input$t_4_hm_2_file_list != "")
-            {
-                if(length(app.variables$fcs.files[[input$t_4_hm_2_file_list]]) > 0)
-                {
-                    pop.ids <- app.variables$populations.list[[input$t_4_hm_2_file_list]]
-                    tmp.mat <- matrix(ncol = 2, nrow=length(pop.ids))
-                    tmp.mat[,1] <- names(pop.ids)
-                    tmp.mat[,2] <- sapply(1:length(pop.ids), function(i){return(length(pop.ids[[i]]))})
-                    colnames(tmp.mat) <- c("level1", "size")
-
-                    tmp.df <- data.frame(tmp.mat, stringsAsFactors = T)
-                    tmp.tree <- d3_nest(tmp.df, value_cols = "size")
-                    file.plot <- sunburst(tmp.tree, legend = TRUE)
-                }
-            }
-        }
-        return(file.plot)
-    })
-
-    output$t_4_hm_hm <- renderPlotly(
-    {
-        file.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_4_hm")
-        {
-            if(length(input$t_4_hm_file_list)>0 && input$t_4_hm_file_list != "")
-            {
-                f.name <- input$t_4_hm_file_list
-                if(length(app.variables$fcs.files[[f.name]]) > 0)
-                {
-                    pop.ids <- app.variables$populations.list[[f.name]]
-                    exp.mat <- app.variables$output.matrices[[f.name]]
-                    col.id <- app.variables$fcs.files[[f.name]][["populations_column"]]
-                    viewed.markers <- as.numeric(unlist(which(app.variables$fcs.files[[f.name]][["markers"]]%in%
-                                                                  input$t_4_hm_markers_list)))
-                    viewed.markers <- viewed.markers[viewed.markers!=col.id]
-
-                    tmp.val <- create.pop.table.from.fcs.matrix(exp.mat, pop.ids, viewed.markers, col.id)
-                    if(!is.null(tmp.val[[2]]))
-                    {
-                        file.plot <- heatmaply(tmp.val[[2]], Rowv = T, Colv="Rowv", dendrogram = "none")
-                    }
-
-                }
-            }
-        }
-        return(file.plot)
-    })
-
-    output$t_4_hm_hm_2 <- renderPlotly(
-    {
-        file.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && input$tabs=="t_4_hm")
-        {
-            if(length(input$t_4_hm_2_file_list)>0 && input$t_4_hm_2_file_list != "")
-            {
-                f.name <- input$t_4_hm_2_file_list
-                if(length(app.variables$fcs.files[[f.name]]) > 0)
-                {
-                    pop.ids <- app.variables$populations.list[[input$t_4_hm_2_file_list]]
-                    exp.mat <- app.variables$output.matrices[[input$t_4_hm_2_file_list]]
-                    col.id <- app.variables$fcs.files[[input$t_4_hm_2_file_list]][["populations_column"]]
-                    viewed.markers <- as.numeric(unlist(which(app.variables$fcs.files[[input$t_4_hm_2_file_list]][["markers"]]%in%
-                                                                  input$t_4_hm_markers_list)))
-                    viewed.markers <- viewed.markers[viewed.markers!=col.id]
-
-                    tmp.val <- create.pop.table.from.fcs.matrix(exp.mat, pop.ids, viewed.markers, col.id)
-                    if(!is.null(tmp.val[[2]]))
-                    {
-                        file.plot <- heatmaply(tmp.val[[2]], Rowv = T, Colv="Rowv", dendrogram = "none")
-                    }
-                }
-            }
-        }
-        return(file.plot)
-    })
-
-
-
-
-
-
-
-    #=============================================DENSITY PLOTS=========================================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_4_hist")
-        {
-            if(length(input[["t_4_hist_file_list"]])>0 && input[["t_4_hist_file_list"]] != "")
-            {
-                f.name <- input[["t_4_hist_file_list"]]
-                if(length(app.variables$fcs.files[[f.name]])>0)
-                {
-                    shinyjs::show("t_4_hist_right")
-                }
-                else
-                {
-                    shinyjs::hide("t_4_hist_right")
-                }
-            }
-            else
-            {
-                shinyjs::hide("t_4_hist_right")
-            }
-        }
-        else
-        {
-            shinyjs::hide("t_4_hist_right")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list("4_hist")
-    })
-
-    observe( #UPDATE FILES LIST
-    {
-        files.list <- list()
-        selected.file <- NULL
-        selected.file.2 <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(!is.na(input[["t_4_hist_set_list"]])  && input[["t_4_hist_set_list"]]!="")
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] ==  input[["t_4_hist_set_list"]])
-                    {
-                        files.list[[length(files.list)+1]] <- names(app.variables$fcs.files)[[i]]
-                    }
-                }
-            }
-            selected.file <- files.list
-            if(!is.na(input$t_4_hist_file_list) && input$t_4_hist_file_list!="")
-            {
-                selected.file <- input$t_4_hist_file_list
-            }
-            selected.file.2 <- files.list
-            if(!is.na(input$t_4_hist_2_file_list) && input$t_4_hist_2_file_list!="")
-            {
-                selected.file.2 <- input$t_4_hist_2_file_list
-            }
-        }
-        updateSelectInput(session, "t_4_hist_file_list", "Select 1st File", choices=files.list, selected=selected.file)
-        updateSelectInput(session, "t_4_hist_2_file_list", "Select 2nd File", choices=files.list, selected=selected.file.2)
-    })
-
-    output$t_4_hist_plots <- renderUI(
-    {
-        plots.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-        {
-            if(!is.na(input$t_4_hist_file_list)>0 && input$t_4_hist_file_list != "")
-            {
-                if(length(app.variables$fcs.files[[input$t_4_hist_file_list]])>0)
-                {
-                    mat <- app.variables$output.matrices[[input$t_4_hist_file_list]]
-                    used.events <- app.variables$used.events[[input$t_4_hist_file_list]]
-                    plots.ui <- lapply(1:ncol(mat), function(i)
-                    {
-                        tmp.ui <- NULL
-                        tmp.plot <- NULL
-                        x <- data.frame(val=mat[used.events,i], group=1)
-                        #==
-                        if(length(input$t_4_hist_2_file_list)>0 && input$t_4_hist_2_file_list != "" &&
-                           length(app.variables$fcs.files[[input$t_4_hist_file_list]])>0)
-                        {
-                            mat.mut <- app.variables$output.matrices[[input$t_4_hist_2_file_list]]
-                            x.2 <- data.frame(val=mat.mut[used.events,i], group=2)
-                            x <- rbind(x,x.2)
-                            x$group <- as.factor(x$group)
-                        }
-                        #==
-                        tmp.plot <- ggplot(x,aes(x=val, fill=group, group=group, col=group)) +
-                            geom_density(alpha=0.25) +
-                            xlab(app.variables$fcs.files[[input$t_4_hist_file_list]][["markers"]][[i]])
-
-                        output[[paste0("t_7_hist_plot_",i)]] <- renderPlot(tmp.plot)
-
-                        tmp.ui <- tagList(
-                            column
-                            (
-                                width=4,
-                                plotOutput(paste0("t_7_hist_plot_",i))
-                            )
-                        )
-                        return(tmp.ui)
-                    })
-                }
-            }
-        }
-        return(plots.ui)
-    })
-
-
-
-
-
-
-
-    #================================================JOYPLOTS===========================================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_4_jp")
-        {
-            if(length(input[["t_4_jp_set_list"]])>0 && input[["t_4_jp_set_list"]] != "")
-            {
-                shinyjs::show("t_4_hist_right")
-            }
-            else
-            {
-                shinyjs::hide("t_4_hist_right")
-            }
-        }
-        else
-        {
-            shinyjs::hide("t_4_hist_right")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list("4_jp")
-    })
-
-    observe( #UPDATE MARKERS LIST
-    {
-        markers.list <- list()
-        selected.markers <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_4_jp")
-        {
-            if(!is.na(input$t_4_jp_set_list)>0 && input$t_4_jp_set_list != "")
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input[["t_4_jp_set_list"]])
-                        {
-                            if(length(markers.list)==0)
-                            {
-                                markers.list <- app.variables$fcs.files[[i]][["markers"]]
-                            }
-                            cross.markers <- which(markers.list%in%app.variables$fcs.files[[i]][["markers"]])
-                            markers.list <- markers.list[unlist(cross.markers)]
-                        }
-                    }
-                }
-            }
-            selected.markers <- markers.list
-            if(!is.na(input$t_4_jp_markers_list) && length(input$t_4_jp_markers_list)>0 && input$t_4_jp_markers_list!="")
-            {
-                selected.markers <- as.list(unlist(input$t_4_jp_markers_list)[input$t_4_jp_markers_list%in%markers.list])
-            }
-        }
-        updateSelectInput(session, "t_4_jp_markers_list", "Select a Marker", choices = markers.list, selected = selected.markers)
-    })
-
-    output$t_4_jp_plots <- renderPlot(
-    {
-        plot.ui <- NULL
-        x <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_4_jp")
-        {
-            if(!is.na(input$t_4_jp_set_list)>0 && input$t_4_jp_set_list != "" &&
-               !is.na(input$t_4_jp_markers_list)>0 && input$t_4_jp_markers_list != "")
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] ==  input[["t_4_jp_set_list"]])
-                    {
-                        used.marker <- unlist(which(app.variables$fcs.files[[i]][["markers"]]==input$t_4_jp_markers_list))
-                        used.events <- app.variables$used.events[[i]]
-                        if(is.null(x))
-                        {
-                            x <- data.frame(par=app.variables$output.matrices[[i]][used.events,used.marker],
-                                            file=app.variables$fcs.files[[i]][["name"]])
-                        }
-                        else
-                        {
-                            x <- rbind(x, data.frame(par=app.variables$output.matrices[[i]][used.events,used.marker],
-                                                     file=app.variables$fcs.files[[i]][["name"]]))
-                        }
-                    }
-                }
-                if(!is.null(x))
-                {
-                    x$file <- as.factor(x$file)
-                    plot.ui <- ggplot(x, aes(x=par,y=file)) + geom_density_ridges2() +
-                        xlab(input$t_4_jp_markers_list) + ylab("density")
-                }
-            }
-        }
-        return(plot.ui)
-    })
-
-
-
-
-
-
-
-    #=============================================DOWNLAOD FILES========================================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_5")
-        {
-            if(length(input[["t_5_set_list"]])>0 && input[["t_5_set_list"]] != "")
-            {
-                nmb.files <- 0
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] == input[["t_5_set_list"]])
-                    {
-                        nmb.files <- nmb.files+1
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    shinyjs::enable("t_5_dl")
-                }
-                else
-                {
-                    shinyjs::disable("t_5_dl")
-                }
-            }
-            else
-            {
-                shinyjs::disable("t_5_dl")
-            }
-        }
-        else
-        {
-            shinyjs::disable("t_5_dl")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list("5")
-    })
-
-    output$t_5_ctrl_list <- renderUI(
-    {
-        ctrl.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_5")
-        {
-            if(length(input$t_5_set_list)>0)
-            {
-                ctrl.ui <- lapply(1:length(app.variables$fcs.files), function(i)
-                {
-                    tmp.ui <- NULL
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input$t_5_set_list &&
-                           app.variables$fcs.files[[i]][["type"]] == "CTRL")
-                        {
-                            tmp.ui <- tagList(
-                                fluidRow
-                                (
-                                    style="margin-top:1.7vh",
-                                    column(
-                                        width=5,
-                                        h6(app.variables$fcs.files[[i]][["name"]])
-                                    ),
-                                    column(
-                                        width=2,
-                                        h6(paste0("Events: ", nrow(app.variables$output.matrices[[i]])))
-                                    ),
-                                    column(
-                                        width=2,
-                                        h6(paste0("Dimensions: ", ncol(app.variables$output.matrices[[i]])))
-                                    ),
-                                    column(
-                                        width=2,
-                                        h6(paste0("Populations: ", length(app.variables$populations.list[[i]])))
-                                    ),
-                                    column(
-                                        width=1,
-                                        checkboxInput(paste0("t_5_",i,"_cb"), NULL)
-                                    )
-                                )
-                            )
-                        }
-                    }
-                    return(tmp.ui)
-                })
-            }
-        }
-        return(ctrl.ui)
-    })
-
-    output$t_5_mut_list <- renderUI(
-    {
-        mut.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_5")
-        {
-            if(length(input$t_5_set_list)>0)
-            {
-                mut.ui <- lapply(1:length(app.variables$fcs.files), function(i)
-                {
-                    tmp.ui <- NULL
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input$t_5_set_list)
-                        {
-                            if(app.variables$fcs.files[[i]][["name"]] == app.variables$fcs.files[[i]][["source_ctrl"]] ||
-                               app.variables$fcs.files[[i]][["type"]] == "CTRL")
-                            {
-                                list.mut <- c()
-                                for(j in 1:length(app.variables$fcs.files))
-                                {
-                                    if(length(app.variables$fcs.files[[j]])>0
-                                       && app.variables$fcs.files[[j]][["type"]] == "MUT"
-                                       && app.variables$fcs.files[[i]][["name"]] == app.variables$fcs.files[[j]][["source_ctrl"]]
-                                       && app.variables$fcs.files[[j]][["set"]] == input$t_5_set_list)
-                                    {
-                                        list.mut <- c(unlist(list.mut),j)
-                                    }
-                                }
-                                if(length(list.mut)>0)
-                                {
-                                    tmp.ui <- tagList(
-                                        fluidRow
-                                        (
-                                            style="margin-bottom:1.7vh;background-color:#00a65a;color:white;margin-left:0.2%;margin-right:0.2%",
-                                            column(
-                                                width=1,
-                                                h6("CONTROL:")
-                                            ),
-                                            column(
-                                                width=11,
-                                                h6(app.variables$fcs.files[[i]][["name"]])
-                                            )
-                                        )
-                                    )
-                                    tmp.mut <- lapply(list.mut, function(j)
-                                    {
-                                        val <- tagList(
-                                            fluidRow
-                                            (
-                                                style="margin-bottom:1.7vh;margin-left:0.2%;margin-right:0.2%",
-                                                column(
-                                                    width=5,
-                                                    h6(app.variables$fcs.files[[j]][["name"]])
-                                                ),
-                                                column(
-                                                    width=2,
-                                                    h6(paste0("Events: ", nrow(app.variables$output.matrices[[j]])))
-                                                ),
-                                                column(
-                                                    width=2,
-                                                    h6(paste0("Dimensions: ", ncol(app.variables$output.matrices[[j]])))
-                                                ),
-                                                column(
-                                                    width=2,
-                                                    h6(paste0("Populations: ", length(app.variables$populations.list[[j]])))
-                                                ),
-                                                column(
-                                                    width=1,
-                                                    checkboxInput(paste0("t_5_",j,"_cb"), NULL)
-                                                )
-                                            )
-                                        )
-                                        return(val)
-                                    })
-                                    tmp.ui <- list(tmp.ui, tmp.mut)
-                                }
-                            }
-                        }
-                    }
-                    return(tmp.ui)
-                })
-            }
-        }
-        return(mut.ui)
-    })
-
-    observeEvent(input$t_5_all, #SELECT ALL
-    {
-        if(input$t_5_all)
-        {
-            updateCheckboxInput(session, "t_5_mut_all","Select all", value=T)
-            updateCheckboxInput(session, "t_5_ctrl_all","Select all", value=T)
-            shinyjs::disable("t_5_mut_all")
-            shinyjs::disable("t_5_ctrl_all")
-        }
-        else
-        {
-            shinyjs::enable("t_5_mut_all")
-            shinyjs::enable("t_5_ctrl_all")
-        }
-    })
-
-    observeEvent(input$t_5_ctrl_all, #SELECT ALL CTRL
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_5")
-        {
-            if(length(input$t_5_set_list)>0)
-            {
-                lapply(1:length(app.variables$fcs.files), function(i)
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input$t_5_set_list &&
-                           app.variables$fcs.files[[i]][["type"]] == "CTRL")
-                        {
-                            if(input$t_5_ctrl_all)
-                            {
-                                updateCheckboxInput(session, paste0("t_5_",i,"_cb"), NULL, value=T)
-                                shinyjs::disable(paste0("t_5_",i,"_cb"))
-                            }
-                            else
-                            {
-                                shinyjs::enable(paste0("t_5_",i,"_cb"))
-                            }
-                        }
-                    }
-                })
-            }
-        }
-    })
-
-    observeEvent(input$t_5_mut_all, #SELECT ALL MUT
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$t_5_ctrl_all)
-        {
-            if(length(input$t_5_set_list)>0)
-            {
-                lapply(1:length(app.variables$fcs.files), function(i)
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input$t_5_set_list)
-                        {
-                            if(app.variables$fcs.files[[i]][["type"]] == "MUT" &&
-                               length(app.variables$fcs.files[[app.variables$fcs.files[[i]][["source_ctrl"]]]])>0)
-                            {
-                                if(input$t_5_mut_all)
-                                {
-                                    updateCheckboxInput(session, paste0("t_5_",i,"_cb"), NULL, T)
-                                    shinyjs::disable(paste0("t_5_",i,"_cb"))
-                                }
-                                else
-                                {
-                                    shinyjs::enable(paste0("t_5_",i,"_cb"))
-                                }
-                            }
-                        }
-                    }
-                })
-            }
-        }
-    })
-
-    output$t_5_dl <- downloadHandler(
-        filename = function()
-        {
-            return("output.zip")
-        },
-        content= function(file)
-        {
-            shinyjs::disable("t_5_dl")
-            files.names <- c()
-            nmb.files <- 0
-
-            progress <- Progress$new()
-            progress$set("Downloading files", value=0)
-
-            if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && length(input[[paste0("t_5_",i,"_cb")]])>0 &&
-                       !is.na(input[[paste0("t_5_",i,"_cb")]]))
-                    {
-                        if(input[[paste0("t_5_",i,"_cb")]])
-                        {
-                            nmb.files <- nmb.files+1
-                        }
-                    }
-                }
-            }
-
-            progress$inc(1/(nmb.files+2), detail=paste0(nmb.files, " files detected"))
-
-            if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0)
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && length(input[[paste0("t_5_",i,"_cb")]])>0 &&
-                       !is.na(input[[paste0("t_5_",i,"_cb")]]))
-                    {
-                        if(input[[paste0("t_5_",i,"_cb")]])
-                        {
-                            tmp.dir <- as.character(trunc(as.numeric(Sys.time())))
-                            dir.create(tmp.dir)
-                            dir.create(paste0(tmp.dir,"/CTRL"))
-                            dir.create(paste0(tmp.dir,"/MUT"))
-                            #==
-                            fcs <- app.variables$fcs.files[[i]][["file"]]
-                            fcs@exprs <- app.variables$output.matrices[[i]][app.variables$used.events[[i]],]
-                            tmp.path <- NULL
-                            if(app.variables$fcs.files[[i]][["type"]]=="MUT")
-                            {
-                                tmp.name <- paste0(tmp.dir,"/MUT/",app.variables$fcs.files[[i]][["name"]],".fcs")
-                                write.FCS(fcs, tmp.name)
-                                files.names <- c(unlist(files.names), tmp.name)
-                            }
-                            else
-                            {
-                                tmp.name <- paste0(tmp.dir,"/CTRL/",app.variables$fcs.files[[i]][["name"]],".fcs")
-                                write.FCS(fcs, tmp.name)
-                                files.names <- c(unlist(files.names), tmp.name)
-                            }
-                            progress$inc(1/(nmb.files+2), detail=paste0(app.variables$fcs.files[[i]][["name"]], " added to download list"))
-                        }
-                    }
-                }
-            }
-            zip(file, files.names)
-            progress$inc(1/(nmb.files+2), detail="Zip archive generated")
-            progress$set("Zip ready", value=1)
-
-            delay(500, progress$close())
-            delay(500, shinyjs::enable("t_5_dl"))
-        }
-    )
-
-
-
-
-
-
-
-    #========================================COMPENSATE AND TRANSFORM===================================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
-    {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_8")
-        {
-            if(length(input[["t_8_set_list"]])>0 && input[["t_8_set_list"]] != "")
-            {
-                nmb.files <- 0
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] == input[["t_8_set_list"]])
-                    {
-                        nmb.files <- nmb.files+1
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    shinyjs::show("t_8_left")
-                    shinyjs::enable("t_8_comp")
-                    shinyjs::enable("t_8_transf")
-                }
-                else
-                {
-                    shinyjs::hide("t_8_left")
-                    shinyjs::disable("t_8_comp")
-                    shinyjs::disable("t_8_transf")
-                }
-            }
-            else
-            {
-                shinyjs::hide("t_8_left")
-                shinyjs::disable("t_8_comp")
-                shinyjs::disable("t_8_transf")
-            }
-        }
-        else
-        {
-            shinyjs::hide("t_8_left")
-            shinyjs::disable("t_8_comp")
-            shinyjs::disable("t_8_transf")
-        }
-    })
-
-    observe( #UPDATE SETS LIST
-    {
-        update.sets.list(8)
-    })
-
-    observe( #UPDATE MARKERS LIST
-    {
-        markers.list <- list()
-        selected.markers <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_8")
-        {
-            if(!is.na(input$t_8_set_list)>0 && input$t_8_set_list != "")
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input[["t_8_set_list"]])
-                        {
-                            if(length(markers.list)==0)
-                            {
-                                markers.list <- app.variables$fcs.files[[i]][["markers"]]
-                            }
-                            cross.markers <- which(markers.list%in%app.variables$fcs.files[[i]][["markers"]])
-                            markers.list <- markers.list[unlist(cross.markers)]
-                        }
-                    }
-                }
-            }
-            selected.markers <- markers.list
-            if(!is.na(input$t_8_markers_list) && length(input$t_8_markers_list)>0 && input$t_8_markers_list!="")
-            {
-                selected.markers <- as.list(unlist(input$t_8_markers_list)[input$t_8_markers_list%in%markers.list])
-            }
-        }
-        updateSelectInput(session, "t_8_markers_list", "Select a Marker", choices = markers.list, selected = selected.markers)
-    })
-
-    output$t_8_files <- renderUI(
-    {
-        files.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_8")
-        {
-            if(!is.na(input$t_8_set_list) && input$t_8_set_list!="")
-            {
-                header.ui <- tagList(
-                    column
-                    (
-                        width=7,
-                        p("NAME")
-                    ),
-                    column
-                    (
-                        width=2,
-                        p("COMPENSATED")
-                    ),
-                    column
-                    (
-                        width=2,
-                        p("TRANSFORMED")
-                    ),
-                    column
-                    (
-                        width=1,
-                        p("SELECT?")
-                    )
+          tmp.ui <- NULL
+
+          ref <- app.variables$ref.objects[[i]]
+          if(length(ref)>0)
+          {
+            tmp.ui <- tagList(
+              fluidRow
+              (
+                style="margin-top:2%",
+                column
+                (
+                  width=1,
+                  checkboxInput(paste0("t_8_ref_",i), "", value = F)
+                ),
+                column
+                (
+                  width=10,
+                  h4(ref$Name)
                 )
-                files.plot <- lapply(1:length(app.variables$fcs.files), function(f.id)
-                {
-                    tmp.ui <- NULL
-                    if(length(app.variables$fcs.files[[f.id]])>0)
-                    {
-                        if(app.variables$fcs.files[[f.id]][["set"]] == input$t_8_set_list)
-                        {
-                            f.comp <- app.variables$fcs.files[[f.id]][["comp"]]
-                            f.transf <- app.variables$fcs.files[[f.id]][["transf"]]
-                            logic.to.text <- c("NO","YES")
-                            selected <- T
-                            if(!is.null(input[[paste0("t_8_cb_",f.id)]]))
-                            {
-                                seected <- input[[paste0("t_8_cb_",f.id)]]
-                            }
-                            tmp.ui <- tagList(
-                                column
-                                (
-                                    width=7,
-                                    p(app.variables$fcs.files[[f.id]][["name"]])
-                                ),
-                                column
-                                (
-                                    width=2,
-                                    p(logic.to.text[f.comp+1])
-                                ),
-                                column
-                                (
-                                    width=2,
-                                    p(logic.to.text[f.transf+1])
-                                ),
-                                column
-                                (
-                                    width=1,
-                                    checkboxInput(paste0("t_8_cb_",f.id), NULL, value=selected)
-                                )
-                            )
-                        }
-                    }
-                    return(tmp.ui)
-                })
-                files.plot <- Filter(Negate(is.null), files.plot)
-                if(!is.null(files.plot))
-                {
-                    files.plot <- list(header.ui, files.plot)
-                }
+              )
+            )
+
+            if(length(app.variables$group.objects)>0 && ref$Name %in%names(app.variables$group.objects) &&
+               length(app.variables$group.objects[[ref$Name]])>0)
+            {
+              tmp.ui <- list(tmp.ui,
+                             lapply(1:length(app.variables$group.objects[[ref$Name]]), function(j)
+                             {
+                               tmp.obj <- app.variables$group.objects[[ref$Name]][[j]]
+                               return(tagList(
+                                 fluidRow
+                                 (
+                                   column
+                                   (
+                                     width=4
+                                   ),
+                                   column
+                                   (
+                                     width=8,
+                                     h5(tmp.obj$Name)
+                                   )
+                                 )
+                               ))
+
+                             }))
+
             }
-        }
-        return(files.plot)
+          }
+
+          return(tmp.ui)
+        })
+      }
+
+      return(files.ui)
     })
 
-    observeEvent(input$t_8_comp,
+  observeEvent(input$t_8_select_all,
+               {
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   for(i in 1:length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[i]]
+                     if(length(ref)>0)
+                     {
+                       updateCheckboxInput(session, paste0("t_8_ref_",i), value = T)
+                     }
+                   }
+                 }
+               })
+
+  observeEvent(input$t_8_deselect_all,
+               {
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   for(i in 1:length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[i]]
+                     if(length(ref)>0)
+                     {
+                       updateCheckboxInput(session, paste0("t_8_ref_",i), value = F)
+                     }
+                   }
+                 }
+               })
+
+  observeEvent(input$t_8_dl_prepare,
+               {
+
+                 shinyjs::disable("t_8_dl_prepare")
+                 files.names <- c()
+                 nmb.files <- 0
+
+                 tmp.dir <- tempdir()
+                 dir.create(tmp.dir)
+                 setwd(tmp.dir)
+                 zip.output.file <- paste0("output.zip")
+                 env.var$zip.output <- paste0(tmp.dir, "/", zip.output.file)
+
+                 progress <- Progress$new()
+                 progress$set("Preparing zip arcihve", value=0)
+
+                 if(length(app.variables$ref.objects)>0)
+                 {
+                   for(i in 1:length(app.variables$ref.objects))
+                   {
+                     ref <- app.variables$ref.objects[[i]]
+                     if(length(ref)>0)
+                     {
+                       if(input[[paste0("t_8_ref_",i)]])
+                       {
+                         nmb.files <- nmb.files + 1
+                         if(length(app.variables$group.objects)>0 && ref$Name %in%names(app.variables$group.objects) &&
+                            length(app.variables$group.objects[[ref$Name]])>0)
+                         {
+                           nmb.files <- nmb.files + length(app.variables$group.objects[[ref$Name]])
+                         }
+                       }
+                     }
+                   }
+                 }
+
+                 progress$inc(1/(nmb.files+2), detail=paste0(nmb.files, " files detected"))
+
+                 if(nmb.files>0)
+                 {
+                   if(length(app.variables$ref.objects)>0)
+                   {
+                     tmp.dir <- tempdir()
+                     for(i in 1:length(app.variables$ref.objects))
+                     {
+                       ref <- app.variables$ref.objects[[i]]
+                       if(length(ref)>0)
+                       {
+                         if(input[[paste0("t_8_ref_",i)]])
+                         {
+
+                           fcs <- save.object.as.FCS(ref$FCSG2)
+
+                           dir.create(tmp.dir)
+
+                           tmp.name <- paste0(tmp.dir,"/",ref$Name, ".fcs")
+                           write.FCS(fcs, tmp.name)
+                           files.names <- c(unlist(files.names), tmp.name)
+                           progress$inc(1/(nmb.files+2), detail=paste0(app.variables$fcs.files[[i]][["name"]], " added to archive"))
+                           #==
+
+                           if(length(app.variables$group.objects)>0 && ref$Name %in%names(app.variables$group.objects) &&
+                              length(app.variables$group.objects[[ref$Name]])>0)
+                           {
+                             for(j in 1:length(app.variables$group.objects[[ref$Name]]))
+                             {
+                               obj <- app.variables$group.objects[[ref$Name]][[j]]
+                               tmp.name <- paste0(tmp.dir,"/",obj$Name, ".fcs")
+                               fcs <- save.object.as.FCS(obj$FCSG2)
+                               write.FCS(fcs, tmp.name)
+                               files.names <- c(unlist(files.names), tmp.name)
+                               progress$inc(1/(nmb.files+2), detail=paste0(app.variables$fcs.files[[i]][["name"]], " added to archive"))
+                             }
+                           }
+                         }
+                       }
+                     }
+                   }
+                   zip(zip.output.file, files.names)
+                   file.remove(unlist(files.names))
+                   setwd(env.var$tool.wd)
+                   progress$inc(1/(nmb.files+2), detail="Zip archive generated")
+                 }
+                 progress$set("Zip ready", value=1)
+                 delay(500, progress$close())
+                 delay(500, shinyjs::enable("t_8_dl_prepare"))
+
+               })
+
+  output$t_8_dl_link <- renderUI(
     {
-        progress <- Progress$new()
-        progress$set("COMPENSATING FILES", value=0)
-        update.log("COMPENSATING FILES")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_8")
-        {
-            if(!is.na(input$t_8_set_list) && input$t_8_set_list!="")
-            {
-                nmb.files <- 0
-                for(f.id in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[f.id]])>0)
-                    {
-                        if(app.variables$fcs.files[[f.id]][["set"]] == input$t_8_set_list)
-                        {
-                            nmb.files <- nmb.files+1
-                        }
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    for(f.id in 1:length(app.variables$fcs.files))
-                    {
-                        if(length(app.variables$fcs.files[[f.id]])>0)
-                        {
-                            if(app.variables$fcs.files[[f.id]][["set"]] == input$t_8_set_list)
-                            {
-                                if(!is.null(input[[paste0("t_8_cb_",f.id)]]) && input[[paste0("t_8_cb_",f.id)]])
-                                {
-                                    tmp.fcs <- app.variables$fcs.files[[f.id]][["file"]]
-                                    tmp.fcs <- m.compensate(tmp.fcs)
-                                    app.variables$output.matrices[[f.id]] <<- tmp.fcs@exprs
-                                    progress$inc(1/nmb.files, detail=paste0(app.variables$fcs.files[[f.id]][["name"]], " compensated"))
-                                    update.log(paste("========", app.variables$fcs.files[[f.id]][["name"]],"compensated"))
-                                    app.variables$fcs.files[[f.id]][["comp"]] <<- T
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        progress$set("FILES COMPENSATED", value=1)
-        update.log("======== FILES COMPENSATED")
-        update.log("")
-        delay(500, progress$close())
+      dl.link <- NULL
+      if(!is.null(env.var$zip.output) && file.exists(env.var$zip.output))
+      {
+        dl.link <- tags$a(href = str_replace(env.var$zip.output,"/media/data/html","http://10.71.1.22/"), "Download")
+      }
+
+      return(dl.link)
     })
 
-    output$t_8_transf_param <- renderUI(
+  #LOCAL VERSION - DOWNLOAD FUNCTION
+  #==============================================================================================================================================
+  # output$t_8_dl <- downloadHandler(
+  #     filename = function()
+  #     {
+  #         return("output.zip")
+  #     },
+  #     content= function(file)
+  #     {
+  #         shinyjs::disable("t_8_dl")
+  #         files.names <- c()
+  #         nmb.files <- 0
+  #
+  #         progress <- Progress$new()
+  #         progress$set("Downloading files", value=0)
+  #
+  #         if(length(app.variables$ref.objects)>0)
+  #         {
+  #             for(i in 1:length(app.variables$ref.objects))
+  #             {
+  #                 ref <- app.variables$ref.objects[[i]]
+  #                 if(length(ref)>0)
+  #                 {
+  #                     if(input[[paste0("t_8_ref_",i)]])
+  #                     {
+  #                         nmb.files <- nmb.files + 1
+  #                         if(length(app.variables$group.objects)>0 && ref$Name %in%names(app.variables$group.objects) &&
+  #                            length(app.variables$group.objects[[ref$Name]])>0)
+  #                         {
+  #                             nmb.files <- nmb.files + length(app.variables$group.objects[[ref$Name]])
+  #                         }
+  #                     }
+  #                 }
+  #             }
+  #         }
+  #
+  #         progress$inc(1/(nmb.files+2), detail=paste0(nmb.files, " files detected"))
+  #
+  #         if(nmb.files>0)
+  #         {
+  #             if(length(app.variables$ref.objects)>0)
+  #             {
+  #                 tmp.dir <- tempdir()
+  #                 for(i in 1:length(app.variables$ref.objects))
+  #                 {
+  #                     ref <- app.variables$ref.objects[[i]]
+  #                     if(length(ref)>0)
+  #                     {
+  #                         if(input[[paste0("t_8_ref_",i)]])
+  #                         {
+  #
+  #                             fcs <- save.object.as.FCS(ref$FCSG2)
+  #
+  #                             dir.create(tmp.dir)
+  #
+  #                             tmp.name <- paste0(tmp.dir,"/",ref$Name, ".fcs")
+  #                             write.FCS(fcs, tmp.name)
+  #                             files.names <- c(unlist(files.names), tmp.name)
+  #                             progress$inc(1/(nmb.files+2), detail=paste0(app.variables$fcs.files[[i]][["name"]], " added to download list"))
+  #                             #==
+  #
+  #                             if(length(app.variables$group.objects)>0 && ref$Name %in%names(app.variables$group.objects) &&
+  #                                length(app.variables$group.objects[[ref$Name]])>0)
+  #                             {
+  #                                 for(j in 1:length(app.variables$group.objects[[ref$Name]]))
+  #                                 {
+  #                                     obj <- app.variables$group.objects[[ref$Name]][[j]]
+  #                                     tmp.name <- paste0(tmp.dir,"/",obj$Name, ".fcs")
+  #                                     fcs <- save.object.as.FCS(obj$FCSG2)
+  #                                     write.FCS(fcs, tmp.name)
+  #                                     files.names <- c(unlist(files.names), tmp.name)
+  #                                     progress$inc(1/(nmb.files+2), detail=paste0(app.variables$fcs.files[[i]][["name"]], " added to download list"))
+  #                                 }
+  #                             }
+  #                         }
+  #                     }
+  #                 }
+  #             }
+  #             zip(file, files.names)
+  #             file.remove(unlist(files.names))
+  #             file.remove(tmp.dir)
+  #             progress$inc(1/(nmb.files+2), detail="Zip archive generated")
+  #         }
+  #         progress$set("Zip ready", value=1)
+  #
+  #         delay(500, progress$close())
+  #         delay(500, shinyjs::enable("t_8_dl"))
+  #     }
+  # )
+  #==============================================================================================================================================
+
+  #===================================================================
+
+
+
+
+
+
+  #INPUT UPDATES
+  #===================================================================
+  observe( #REFERENCE
     {
-        params.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_8")
-        {
-            selected.transform <- as.numeric(input$t_8_transf_type)
-            if(selected.transform == 2)
-            {
-                params.ui <- numericInput("t_8_arcsinh", "Arcsinh cofactor", value="5")
-            }
-        }
-        return(params.ui)
+      update.ref.sel("t_1_files_rm_sel")
     })
 
-    observeEvent(input$t_8_transf,
+
+
+
+  observe( #Generate Models - POP MODIFICATION
     {
-        progress <- Progress$new()
-        progress$set("TRANSFORMING FILES", value=0)
-        update.log("TRANSFORMING FILES")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_8")
-        {
-            selected.transform <- as.numeric(input$t_8_transf_type)
-            selected.algo <- NULL
-            if(selected.transform == 1)
-            {
-                selected.algo <- m.transform.logicle
-                selected.algo.params <- NULL
-            }
-            else
-            {
-                selected.algo <- m.transform.asinh
-                selected.algo.params <- as.numeric(input$t_8_arcsinh)
-            }
-
-            if(!is.na(input$t_8_set_list) && input$t_8_set_list!="" && !is.null(selected.algo))
-            {
-                markers.list <- input$t_8_markers_list
-                nmb.files <- 0
-                for(f.id in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[f.id]])>0)
-                    {
-                        if(app.variables$fcs.files[[f.id]][["set"]] == input$t_8_set_list)
-                        {
-                            nmb.files <- nmb.files+1
-                        }
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    for(f.id in 1:length(app.variables$fcs.files))
-                    {
-                        if(length(app.variables$fcs.files[[f.id]])>0)
-                        {
-                            if(app.variables$fcs.files[[f.id]][["set"]] == input$t_8_set_list)
-                            {
-                                if(!is.null(input[[paste0("t_8_cb_",f.id)]]) && input[[paste0("t_8_cb_",f.id)]])
-                                {
-                                    tmp.fcs <- app.variables$fcs.files[[f.id]][["file"]]
-                                    tmp.fcs <- selected.algo(tmp.fcs, markers.list, selected.algo.params)
-                                    app.variables$output.matrices[[f.id]] <<- tmp.fcs@exprs
-                                    progress$inc(1/nmb.files, detail=paste0(app.variables$fcs.files[[f.id]][["name"]], " transformed"))
-                                    update.log(paste("========", app.variables$fcs.files[[f.id]][["name"]],"transformed"))
-                                    app.variables$fcs.files[[f.id]][["transf"]] <<- T
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        progress$set("FILES TRANSFORMED", value=1)
-        update.log("======== FILES TRANSFORMED")
-        update.log("")
-        delay(500, progress$close())
+      update.ref.sel("t_3_pop_ref_sel")
     })
 
-
-
-
-
-
-
-    #====================================DECOMPENSATE AND DETRANSFORM===================================================
-
-
-
-
-
-
-
-    observe( #CLEAR UI
+  observe(
     {
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_9")
-        {
-            if(length(input[["t_9_set_list"]])>0 && input[["t_9_set_list"]] != "")
-            {
-                nmb.files <- 0
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0 && app.variables$fcs.files[[i]][["set"]] == input[["t_9_set_list"]])
-                    {
-                        nmb.files <- nmb.files+1
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    shinyjs::show("t_9_left")
-                    shinyjs::enable("t_9_comp")
-                    shinyjs::enable("t_9_transf")
-                }
-                else
-                {
-                    shinyjs::hide("t_9_left")
-                    shinyjs::disable("t_9_comp")
-                    shinyjs::disable("t_9_transf")
-                }
-            }
-            else
-            {
-                shinyjs::hide("t_9_left")
-                shinyjs::disable("t_9_comp")
-                shinyjs::disable("t_9_transf")
-            }
-        }
-        else
-        {
-            shinyjs::hide("t_9_left")
-            shinyjs::disable("t_9_comp")
-            shinyjs::disable("t_9_transf")
-        }
+      update.markers.sel("t_3_pop_move_markers_sel", "t_3_pop_ref_sel")
     })
 
-    observe( #UPDATE SETS LIST
+  observe(
     {
-        update.sets.list(9)
+      update.markers.sel("t_3_pop_m1","t_3_pop_ref_sel")
+      update.markers.sel("t_3_pop_m2","t_3_pop_ref_sel")
     })
 
-    observe( #UPDATE MARKERS LIST
+
+
+
+  observe( #Generate Models - TP
     {
-        markers.list <- list()
-        selected.markers <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_9")
-        {
-            if(!is.na(input$t_9_set_list)>0 && input$t_9_set_list != "")
-            {
-                for(i in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[i]])>0)
-                    {
-                        if(app.variables$fcs.files[[i]][["set"]] ==  input[["t_9_set_list"]])
-                        {
-                            if(length(markers.list)==0)
-                            {
-                                markers.list <- app.variables$fcs.files[[i]][["markers"]]
-                            }
-                            cross.markers <- which(markers.list%in%app.variables$fcs.files[[i]][["markers"]])
-                            markers.list <- markers.list[unlist(cross.markers)]
-                        }
-                    }
-                }
-            }
-            selected.markers <- markers.list
-            if(!is.na(input$t_9_markers_list) && length(input$t_9_markers_list)>0 && input$t_9_markers_list!="")
-            {
-                selected.markers <- as.list(unlist(input$t_9_markers_list)[input$t_9_markers_list%in%markers.list])
-            }
-        }
-        updateSelectInput(session, "t_9_markers_list", "Select a Marker", choices = markers.list, selected = selected.markers)
+      update.ref.sel("t_3_tp_ref_sel")
     })
 
-    output$t_9_files <- renderUI(
+  observe(
     {
-        files.plot <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_9")
-        {
-            if(!is.na(input$t_9_set_list) && input$t_9_set_list!="")
-            {
-                header.ui <- tagList(
-                    column
-                    (
-                        width=7,
-                        p("NAME")
-                    ),
-                    column
-                    (
-                        width=2,
-                        p("COMPENSATED")
-                    ),
-                    column
-                    (
-                        width=2,
-                        p("TRANSFORMED")
-                    ),
-                    column
-                    (
-                        width=1,
-                        p("SELECT?")
-                    )
-                )
-                files.plot <- lapply(1:length(app.variables$fcs.files), function(f.id)
-                {
-                    tmp.ui <- NULL
-                    if(length(app.variables$fcs.files[[f.id]])>0)
-                    {
-                        if(app.variables$fcs.files[[f.id]][["set"]] == input$t_9_set_list)
-                        {
-                            f.comp <- app.variables$fcs.files[[f.id]][["comp"]]
-                            f.transf <- app.variables$fcs.files[[f.id]][["transf"]]
-                            logic.to.text <- c("NO","YES")
-                            selected <- T
-                            if(!is.null(input[[paste0("t_9_cb_",f.id)]]))
-                            {
-                                seected <- input[[paste0("t_9_cb_",f.id)]]
-                            }
-                            tmp.ui <- tagList(
-                                column
-                                (
-                                    width=7,
-                                    p(app.variables$fcs.files[[f.id]][["name"]])
-                                ),
-                                column
-                                (
-                                    width=2,
-                                    p(logic.to.text[f.comp+1])
-                                ),
-                                column
-                                (
-                                    width=2,
-                                    p(logic.to.text[f.transf+1])
-                                ),
-                                column
-                                (
-                                    width=1,
-                                    checkboxInput(paste0("t_9_cb_",f.id), NULL, value=selected)
-                                )
-                            )
-                        }
-                    }
-                    return(tmp.ui)
-                })
-                files.plot <- Filter(Negate(is.null), files.plot)
-                if(!is.null(files.plot))
-                {
-                    files.plot <- list(header.ui, files.plot)
-                }
-            }
-        }
-        return(files.plot)
+      update.markers.sel("t_3_tp_M1", "t_3_tp_ref_sel")
+      update.markers.sel("t_3_tp_M2", "t_3_tp_ref_sel")
     })
 
-    observeEvent(input$t_9_decomp,
+
+
+
+  observe( #Generate Models - MIX
     {
-        progress <- Progress$new()
-        progress$set("DECOMPENSATING FILES", value=0)
-        update.log("DECOMPENSATING FILES")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_9")
-        {
-            if(!is.na(input$t_9_set_list) && input$t_9_set_list!="")
-            {
-                nmb.files <- 0
-                for(f.id in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[f.id]])>0)
-                    {
-                        if(app.variables$fcs.files[[f.id]][["set"]] == input$t_9_set_list)
-                        {
-                            nmb.files <- nmb.files+1
-                        }
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    for(f.id in 1:length(app.variables$fcs.files))
-                    {
-                        if(length(app.variables$fcs.files[[f.id]])>0)
-                        {
-                            if(app.variables$fcs.files[[f.id]][["set"]] == input$t_9_set_list)
-                            {
-                                if(!is.null(input[[paste0("t_9_cb_",f.id)]]) && input[[paste0("t_9_cb_",f.id)]])
-                                {
-                                    tmp.fcs <- app.variables$fcs.files[[f.id]][["file"]]
-                                    tmp.fcs <- m.compensate(tmp.fcs)
-                                    app.variables$output.matrices[[f.id]] <<- tmp.fcs@exprs
-                                    progress$inc(1/nmb.files, detail=paste0(app.variables$fcs.files[[f.id]][["name"]], " decompensated"))
-                                    update.log(paste("========", app.variables$fcs.files[[f.id]][["name"]]," decompensated"))
-                                    app.variables$fcs.files[[f.id]][["comp"]] <<- F
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        progress$set("FILES DECOMPENSATED", value=1)
-        update.log("======== FILES COMPENSATED")
-        update.log("")
-        delay(500, progress$close())
+      update.ref.sel("t_3_mix_r1_sel")
+      update.ref.sel("t_3_mix_r2_sel")
     })
 
-    output$t_9_transf_param <- renderUI(
+  observe(
     {
-        params.ui <- NULL
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_9")
-        {
-            selected.transform <- as.numeric(input$t_9_transf_type)
-            if(selected.transform == 2)
-            {
-                params.ui <- numericInput("t_9_arcsinh", "Arcsinh cofactor", value="5")
-            }
-        }
-        return(params.ui)
+      update.populations.sel("t_3_mix_r1_pop_sel","t_3_mix_r1_sel")
+      update.populations.sel("t_3_mix_r2_pop_sel","t_3_mix_r2_sel")
     })
 
-    observeEvent(input$t_9_detransf,
+
+
+  observe( #Generate Groups
     {
-        progress <- Progress$new()
-        progress$set("DETRANSFORMING FILES", value=0)
-        update.log("DETRANSFORMING FILES")
-        if(length(app.variables$fcs.files)>0 && length(app.variables$sets.list)>0 && input$tabs=="t_9")
-        {
-            selected.transform <- as.numeric(input$t_9_transf_type)
-            selected.algo <- NULL
-            if(selected.transform == 1)
-            {
-                selected.algo <- m.transform.logicle
-                selected.algo.params <- NULL
-            }
-            else
-            {
-                selected.algo <- m.transform.asinh
-                selected.algo.params <- as.numeric(input$t_9_arcsinh)
-            }
-
-            if(!is.na(input$t_9_set_list) && input$t_9_set_list!="" && !is.null(selected.algo))
-            {
-                markers.list <- input$t_9_markers_list
-                nmb.files <- 0
-                for(f.id in 1:length(app.variables$fcs.files))
-                {
-                    if(length(app.variables$fcs.files[[f.id]])>0)
-                    {
-                        if(app.variables$fcs.files[[f.id]][["set"]] == input$t_9_set_list)
-                        {
-                            nmb.files <- nmb.files+1
-                        }
-                    }
-                }
-                if(nmb.files>0)
-                {
-                    for(f.id in 1:length(app.variables$fcs.files))
-                    {
-                        if(length(app.variables$fcs.files[[f.id]])>0)
-                        {
-                            if(app.variables$fcs.files[[f.id]][["set"]] == input$t_9_set_list)
-                            {
-                                if(!is.null(input[[paste0("t_9_cb_",f.id)]]) && input[[paste0("t_9_cb_",f.id)]])
-                                {
-                                    tmp.fcs <- app.variables$fcs.files[[f.id]][["file"]]
-                                    tmp.fcs <- selected.algo(tmp.fcs, markers.list, selected.algo.params)
-                                    app.variables$output.matrices[[f.id]] <<- tmp.fcs@exprs
-                                    progress$inc(1/nmb.files, detail=paste0(app.variables$fcs.files[[f.id]][["name"]], " detransformed"))
-                                    update.log(paste("========", app.variables$fcs.files[[f.id]][["name"]]," detransformed"))
-                                    app.variables$fcs.files[[f.id]][["transf"]] <<- F
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        progress$set("FILES DETRANSFORMED", value=1)
-        update.log("FILES DETRANSFORMED")
-        update.log("")
-        delay(500, progress$close())
+      update.ref.sel("t_4_ref_sel")
     })
 
-
-
-
-
-
-
-    #=================================================LOG===============================================================
-
-
-
-
-
-
-
-    output$log <- renderText(
+  observe(
     {
-        return(app.variables$log.text)
+      update.markers.sel("t_4_shifted_markers", "t_4_ref_sel")
     })
 
 
+
+  observe( #Visualization - HEATMAPS
+    {
+      update.ref.sel("t_6_hm_ref1_sel")
+      update.ref.sel("t_6_hm_ref2_sel")
+    })
+
+
+
+
+  observe( #Visualization - JOYPLOT
+    {
+      update.ref.sel("t_6_jp_ref_sel")
+    })
+
+
+
+  observe( #Visualization - JOYPLOT
+    {
+      update.ref.sel("t_6_sc_ref_sel")
+    })
+  observe( #Visualization - JOYPLOT
+    {
+      update.markers.sel("t_6_sc_m1_sel", "t_6_sc_ref_sel")
+      update.markers.sel("t_6_sc_m2_sel", "t_6_sc_ref_sel")
+      update.populations.sel("t_6_sc_pop_sel", "t_6_sc_ref_sel")
+    })
+  #===================================================================
 
 }
